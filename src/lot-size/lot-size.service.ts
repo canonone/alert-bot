@@ -100,7 +100,7 @@ export class LotSizeService {
       }
 
       this.logger.log(`Fetching ${conversionPair} for pip value conversion...`)
-      const rate = await this.marketData.getCurrentPrice(conversionPair, apiKey)
+      const { price: rate } = await this.marketData.getCurrentPrice(conversionPair, apiKey)
 
       if (rate === null) {
         return this.errorResult(

@@ -428,7 +428,7 @@ export class TelegramBotService implements OnModuleInit {
     }
 
     const symbol = parts[1].toUpperCase()
-    const price = await this.marketData.getCurrentPrice(symbol, user.twelveDataApiKey)
+    const { price } = await this.marketData.getCurrentPrice(symbol, user.twelveDataApiKey)
 
     if (price === null) {
       await this.sendMessageToUser(chatId, `❌ Could not fetch price for <b>${symbol}</b>.\n\nCheck the symbol or try again.`)

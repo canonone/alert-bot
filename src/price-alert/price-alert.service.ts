@@ -202,15 +202,21 @@ export class PriceAlertService {
   async checkAlertsForUser(
     chatId: string,
     apiKey: string,
-  ): Promise<Array<{ alert: PriceAlert; currentPrice: number }>> {
+  ): Promise<{ triggered: Array<{ alert: PriceAlert; currentPrice: number }>; quotaExceeded: boolean }> {
     const active = await this.alertRepo.find({ where: { chatId, active: true } })
-    if (active.length === 0) return []
+    if (active.length === 0) return { triggered: [], quotaExceeded: false }
 
     const symbols = [...new Set(active.map((a) => a.symbol))]
     this.logger.log(`[${chatId}] Checking ${symbols.length} symbol(s)...`)
 
     // Batch fetch all prices in one API call
-    const prices = await this.marketData.getBatchPrices(symbols, apiKey)
+    const { prices, quotaExceeded } = await this.marketData.getBatchPrices(symbols, apiKey)
+
+    if (quotaExceeded) {
+      this.logger.warn(`[${chatId}] Quota exceeded`)
+      return { triggered: [], quotaExceeded: true }
+    }
+
     const triggered: Array<{ alert: PriceAlert; currentPrice: number }> = []
 
     for (const alert of active) {
@@ -229,7 +235,7 @@ export class PriceAlertService {
       }
     }
 
-    return triggered
+    return { triggered, quotaExceeded: false }
   }
 
   // ── Alert trigger logic ───────────────────────────────────────
