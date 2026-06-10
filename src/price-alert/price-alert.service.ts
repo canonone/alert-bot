@@ -78,7 +78,7 @@ export class PriceAlertService {
         `🔢 Alert ID: <b>#${userAlertId}</b>\n` +
         `━━━━━━━━━━━━━━━━━━━━\n` +
         `You'll be notified when price reaches this level.\n` +
-        `Prices checked every 15 minutes ⏱`,
+        `Real-time alerts via live price feed ⚡`,
     }
   }
 
