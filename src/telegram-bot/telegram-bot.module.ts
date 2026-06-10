@@ -6,10 +6,12 @@ import { LotSizeModule } from '../lot-size/lot-size.module'
 import { UsersModule } from '../users/users.module'
 import { MarketDataModule } from '../market-data/market-data.module'
 import { InviteModule } from '../invite/invite.module'
+import { EmaAlertModule } from '../ema-alert/ema-alert.module'
 
 @Module({
   imports: [
     forwardRef(() => PriceAlertModule),
+    forwardRef(() => EmaAlertModule),
     LotSizeModule,
     UsersModule,
     MarketDataModule,

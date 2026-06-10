@@ -36,6 +36,9 @@ export class User {
   @Column({ type: 'boolean', default: false, name: 'is_setup' })
   isSetup: boolean
 
+  @Column({ type: 'int', default: 0, name: 'alert_id_counter' })
+  alertIdCounter: number
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date
 

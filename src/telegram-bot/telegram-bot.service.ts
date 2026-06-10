@@ -1,10 +1,12 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common'
+import { Injectable, Logger, OnModuleInit, Inject, forwardRef } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
 import { PriceAlertService } from '../price-alert/price-alert.service'
 import { LotSizeService } from '../lot-size/lot-size.service'
 import { UsersService } from '../users/users.service'
 import { MarketDataService } from '../market-data/market-data.service'
 import { InviteService } from '../invite/invite.service'
+import { EmaAlertService } from '../ema-alert/ema-alert.service'
+import { FinnhubService } from '../ema-alert/finnhub.service'
 import { AlertType } from '../price-alert/price-alert.entity'
 import axios from 'axios'
 
@@ -23,6 +25,10 @@ export class TelegramBotService implements OnModuleInit {
     private readonly usersService: UsersService,
     private readonly marketData: MarketDataService,
     private readonly inviteService: InviteService,
+    @Inject(forwardRef(() => EmaAlertService))
+    private readonly emaAlertService: EmaAlertService,
+    @Inject(forwardRef(() => FinnhubService))
+    private readonly finnhubService: FinnhubService,
   ) {
     this.botToken = this.configService.getOrThrow('TELEGRAM_BOT_TOKEN')
     this.baseUrl = `https://api.telegram.org/bot${this.botToken}`
@@ -138,6 +144,10 @@ export class TelegramBotService implements OnModuleInit {
       case '/lotsize':      return this.handleLotSize(chatId, parts)
       case '/price':        return this.handlePrice(chatId, parts)
       case '/pairs':        return this.handlePairs(chatId)
+      case '/ema':          return this.handleEma(chatId, parts)
+      case '/listema':      return this.handleListEma(chatId)
+      case '/cancelema':    return this.handleCancelEma(chatId, parts)
+      case '/cancelemas':   return this.handleCancelEmas(chatId, parts)
     }
   }
 
@@ -466,6 +476,17 @@ export class TelegramBotService implements OnModuleInit {
       `<b>📦 Lot Size</b>\n\n` +
       `<code>/lotsize [PAIR] [RISK$] [SL PIPS]</code>\n\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
+      `<b>📈 EMA Alerts</b>\n\n` +
+      `<code>/ema [PAIR] [TIMEFRAME] [DIRECTION]</code>\n` +
+      `<code>/listema</code> — view active EMA alerts\n` +
+      `<code>/cancelema [ID]</code> — cancel by ID\n` +
+      `<code>/cancelemas [SYMBOL or all]</code>\n\n` +
+      `Timeframes: <b>5</b> | <b>30</b>\n` +
+      `Directions: <b>up</b> | <b>down</b>\n\n` +
+      `Examples:\n` +
+      `<code>/ema GBPUSD 5 up</code>\n` +
+      `<code>/ema EURUSD 30 down</code>\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
       `<b>📊 Market</b>\n\n` +
       `<code>/price [PAIR]</code>\n` +
       `<code>/pairs</code>\n\n` +
@@ -483,6 +504,93 @@ export class TelegramBotService implements OnModuleInit {
     }
 
     await this.sendMessageToUser(chatId, msg)
+  }
+
+  // ── /ema ──────────────────────────────────────────────────────
+
+  private async handleEma(chatId: string, parts: string[]): Promise<void> {
+    if (parts.length !== 4) {
+      await this.sendMessageToUser(
+        chatId,
+        `❌ <b>Invalid format</b>\n\n` +
+        `Usage: <code>/ema [PAIR] [TIMEFRAME] [DIRECTION]</code>\n\n` +
+        `Timeframes: <b>5</b> | <b>30</b>\n` +
+        `Directions: <b>up</b> | <b>down</b>\n\n` +
+        `Examples:\n` +
+        `<code>/ema GBPUSD 5 up</code>\n` +
+        `<code>/ema EURUSD 30 down</code>\n` +
+        `<code>/ema XAUUSD 5 down</code>`,
+      )
+      return
+    }
+
+    const user = await this.usersService.findByChatId(chatId)
+    if (!user?.isSetup) { await this.sendSetupPrompt(chatId); return }
+
+    const symbol = parts[1].toUpperCase()
+    const tfRaw = parts[2]
+    const dirRaw = parts[3].toLowerCase()
+
+    if (!['5', '30'].includes(tfRaw)) {
+      await this.sendMessageToUser(chatId, `❌ Invalid timeframe. Use <b>5</b> or <b>30</b>.`)
+      return
+    }
+
+    if (!['up', 'down'].includes(dirRaw)) {
+      await this.sendMessageToUser(chatId, `❌ Invalid direction. Use <b>up</b> or <b>down</b>.`)
+      return
+    }
+
+    const timeframe = tfRaw === '5' ? '5M' : '30M'
+    const direction = dirRaw === 'up' ? 'cross_up' : 'cross_down'
+
+    const result = await this.emaAlertService.addAlert(chatId, symbol, timeframe, direction)
+    await this.sendMessageToUser(chatId, result.message)
+
+    if (result.success) {
+      this.finnhubService.subscribeToSymbol(symbol)
+    }
+  }
+
+  // ── /listema ──────────────────────────────────────────────────
+
+  private async handleListEma(chatId: string): Promise<void> {
+    const message = await this.emaAlertService.listAlerts(chatId)
+    await this.sendMessageToUser(chatId, message)
+  }
+
+  // ── /cancelema ────────────────────────────────────────────────
+
+  private async handleCancelEma(chatId: string, parts: string[]): Promise<void> {
+    if (parts.length !== 2) {
+      await this.sendMessageToUser(chatId, `❌ Usage: <code>/cancelema [ID]</code>\n\nExample: <code>/cancelema 5</code>`)
+      return
+    }
+    const id = parseInt(parts[1])
+    if (isNaN(id)) { await this.sendMessageToUser(chatId, `❌ Invalid ID. Please use a number.`); return }
+    const result = await this.emaAlertService.cancelAlert(chatId, id)
+    await this.sendMessageToUser(chatId, result.message)
+  }
+
+  // ── /cancelemas ───────────────────────────────────────────────
+
+  private async handleCancelEmas(chatId: string, parts: string[]): Promise<void> {
+    if (parts.length !== 2) {
+      await this.sendMessageToUser(
+        chatId,
+        `❌ Usage: <code>/cancelemas [SYMBOL or all]</code>\n\n` +
+        `<code>/cancelemas GBPUSD</code>\n` +
+        `<code>/cancelemas all</code>`,
+      )
+      return
+    }
+    if (parts[1].toLowerCase() === 'all') {
+      const result = await this.emaAlertService.cancelAllAlerts(chatId)
+      await this.sendMessageToUser(chatId, result.message)
+    } else {
+      const result = await this.emaAlertService.cancelBySymbol(chatId, parts[1])
+      await this.sendMessageToUser(chatId, result.message)
+    }
   }
 
   // ── Helpers ───────────────────────────────────────────────────

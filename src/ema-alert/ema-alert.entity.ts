@@ -8,15 +8,12 @@ import {
 } from 'typeorm'
 import { User } from '../users/user.entity'
 
-export type AlertType = 'SL' | 'TP' | 'TARGET'
-
-@Entity('price_alerts')
-export class PriceAlert {
+@Entity('ema_alerts')
+export class EmaAlert {
   @PrimaryGeneratedColumn()
   id: number
 
-  // Owner of this alert
-  @ManyToOne(() => User, (user) => user.alerts, { onDelete: 'CASCADE' })
+  @ManyToOne(() => User, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'chat_id' })
   user: User
 
@@ -26,11 +23,14 @@ export class PriceAlert {
   @Column({ type: 'varchar' })
   symbol: string
 
-  @Column({ type: 'varchar' })
-  type: AlertType
+  @Column({ type: 'int', name: 'ema_length', default: 10 })
+  emaLength: number
 
-  @Column({ type: 'decimal', precision: 18, scale: 6, name: 'target_price' })
-  targetPrice: number
+  @Column({ type: 'varchar' })
+  timeframe: string
+
+  @Column({ type: 'varchar' })
+  direction: string
 
   @Column({ type: 'int', nullable: false, name: 'user_alert_id', default: 0 })
   userAlertId: number

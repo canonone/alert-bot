@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common'
 import { ConfigModule, ConfigService } from '@nestjs/config'
-import { ScheduleModule } from '@nestjs/schedule'
+import { ScheduleModule as NestScheduleModule } from '@nestjs/schedule'
 import { TypeOrmModule } from '@nestjs/typeorm'
 import { UsersModule } from './users/users.module'
 import { MarketDataModule } from './market-data/market-data.module'
@@ -8,14 +8,17 @@ import { PriceAlertModule } from './price-alert/price-alert.module'
 import { TelegramBotModule } from './telegram-bot/telegram-bot.module'
 import { LotSizeModule } from './lot-size/lot-size.module'
 import { InviteModule } from './invite/invite.module'
+import { EmaAlertModule } from './ema-alert/ema-alert.module'
+import { ScheduleModule } from './schedule/schedule.module'
 import { User } from './users/user.entity'
 import { PriceAlert } from './price-alert/price-alert.entity'
 import { InviteCode } from './invite/invite-code.entity'
+import { EmaAlert } from './ema-alert/ema-alert.entity'
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
-    ScheduleModule.forRoot(),
+    NestScheduleModule.forRoot(),
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
@@ -25,7 +28,7 @@ import { InviteCode } from './invite/invite-code.entity'
         username: config.getOrThrow('DB_USERNAME'),
         password: config.getOrThrow('DB_PASSWORD'),
         database: config.getOrThrow('DB_NAME'),
-        entities: [User, PriceAlert, InviteCode],
+        entities: [User, PriceAlert, InviteCode, EmaAlert],
         synchronize: true,
         logging: config.get('NODE_ENV') === 'development',
       }),
@@ -35,6 +38,8 @@ import { InviteCode } from './invite/invite-code.entity'
     LotSizeModule,
     PriceAlertModule,
     InviteModule,
+    EmaAlertModule,
+    ScheduleModule,
     TelegramBotModule,
   ],
 })

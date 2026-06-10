@@ -69,6 +69,18 @@ export class UsersService {
     await this.userRepo.update({ chatId }, { twelveDataApiKey: null, isSetup: false })
   }
 
+  // ── Per-user alert ID counter ─────────────────────────────────
+
+  async getNextAlertId(chatId: string): Promise<number> {
+    await this.userRepo.increment({ chatId }, 'alertIdCounter', 1)
+    const user = await this.userRepo.findOne({ where: { chatId } })
+    return user.alertIdCounter
+  }
+
+  async resetAllAlertIdCounters(): Promise<void> {
+    await this.userRepo.update({}, { alertIdCounter: 0 })
+  }
+
   // ── Check admin ───────────────────────────────────────────────
 
   isAdminChatId(chatId: string): boolean {

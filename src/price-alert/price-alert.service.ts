@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm'
 import { Repository } from 'typeorm'
 import { PriceAlert, AlertType } from './price-alert.entity'
 import { MarketDataService } from '../market-data/market-data.service'
+import { UsersService } from '../users/users.service'
 
 const ALLOWED_SYMBOLS = new Set([
   'AUDCAD', 'AUDCHF', 'AUDJPY', 'AUDNZD', 'AUDUSD',
@@ -23,6 +24,7 @@ export class PriceAlertService {
     @InjectRepository(PriceAlert)
     private readonly alertRepo: Repository<PriceAlert>,
     private readonly marketData: MarketDataService,
+    private readonly usersService: UsersService,
   ) {}
 
   // ── Add alert ─────────────────────────────────────────────────
@@ -51,15 +53,18 @@ export class PriceAlertService {
       }
     }
 
+    const userAlertId = await this.usersService.getNextAlertId(chatId)
+
     const alert = this.alertRepo.create({
       chatId,
       symbol: upperSymbol,
       type,
       targetPrice,
+      userAlertId,
       active: true,
     })
 
-    const saved = await this.alertRepo.save(alert)
+    await this.alertRepo.save(alert)
     const emoji = this.getEmoji(type)
 
     return {
@@ -70,7 +75,7 @@ export class PriceAlertService {
         `📊 Symbol: <b>${upperSymbol}</b>\n` +
         `📌 Type: <b>${type}</b>\n` +
         `💰 Target Price: <b>${targetPrice}</b>\n` +
-        `🔢 Alert ID: <b>#${saved.id}</b>\n` +
+        `🔢 Alert ID: <b>#${userAlertId}</b>\n` +
         `━━━━━━━━━━━━━━━━━━━━\n` +
         `You'll be notified when price reaches this level.\n` +
         `Prices checked every 15 minutes ⏱`,
@@ -84,7 +89,7 @@ export class PriceAlertService {
     id: number,
   ): Promise<{ success: boolean; message: string }> {
     const alert = await this.alertRepo.findOne({
-      where: { id, chatId, active: true },
+      where: { userAlertId: id, chatId, active: true },
     })
 
     if (!alert) {
@@ -94,7 +99,7 @@ export class PriceAlertService {
       }
     }
 
-    await this.alertRepo.update({ id }, { active: false })
+    await this.alertRepo.update({ id: alert.id }, { active: false })
 
     return {
       success: true,
@@ -185,7 +190,7 @@ export class PriceAlertService {
       message += `━━━━━━━━━━━━━━━━━━━━\n`
       message += `📊 <b>${symbol}</b>\n`
       for (const a of symbolAlerts) {
-        message += `  ${this.getEmoji(a.type)} ${a.type} @ <b>${a.targetPrice}</b> — #<b>${a.id}</b>\n`
+        message += `  ${this.getEmoji(a.type)} ${a.type} @ <b>${a.targetPrice}</b> — #<b>${a.userAlertId}</b>\n`
       }
     }
 
@@ -195,6 +200,25 @@ export class PriceAlertService {
     message += `/cancelalerts all — cancel everything`
 
     return message
+  }
+
+  // ── Daily cleanup: cancel all active alerts system-wide ───────
+
+  async cancelAllAlertsForAllUsers(): Promise<Map<string, { priceCount: number }>> {
+    const activeAlerts = await this.alertRepo.find({ where: { active: true } })
+
+    const countMap = new Map<string, { priceCount: number }>()
+    for (const alert of activeAlerts) {
+      const current = countMap.get(alert.chatId) ?? { priceCount: 0 }
+      current.priceCount++
+      countMap.set(alert.chatId, current)
+    }
+
+    if (activeAlerts.length > 0) {
+      await this.alertRepo.update({ active: true }, { active: false })
+    }
+
+    return countMap
   }
 
   // ── Cron: check all alerts for a specific user ────────────────
