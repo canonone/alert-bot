@@ -348,6 +348,10 @@ export class TelegramBotService implements OnModuleInit {
 
     const result = await this.priceAlertService.addAlert(chatId, symbol, type as AlertType, price)
     await this.sendMessageToUser(chatId, result.message)
+
+    if (result.success) {
+      this.finnhubService.subscribeToSymbol(symbol)
+    }
   }
 
   // ── /listalerts ───────────────────────────────────────────────
@@ -492,7 +496,7 @@ export class TelegramBotService implements OnModuleInit {
       `<code>/pairs</code>\n\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `🔴 SL · 🟢 TP · 🎯 TARGET\n` +
-      `Prices checked every 15 minutes ⏱`
+      `Real-time price alerts via live feed ⚡`
 
     if (isAdmin) {
       msg +=

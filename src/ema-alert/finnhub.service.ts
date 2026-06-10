@@ -5,6 +5,7 @@ import axios from 'axios'
 import { EmaAlertService } from './ema-alert.service'
 import { CandleBuilderService } from './candle-builder.service'
 import { EmaCalculatorService } from './ema-calculator.service'
+import { PriceAlertService } from '../price-alert/price-alert.service'
 import { TelegramBotService } from '../telegram-bot/telegram-bot.service'
 
 @Injectable()
@@ -21,6 +22,7 @@ export class FinnhubService implements OnModuleInit, OnModuleDestroy {
     private readonly emaAlertService: EmaAlertService,
     private readonly candleBuilder: CandleBuilderService,
     private readonly emaCalculator: EmaCalculatorService,
+    private readonly priceAlertService: PriceAlertService,
     @Inject(forwardRef(() => TelegramBotService))
     private readonly telegramBot: TelegramBotService,
   ) {
@@ -68,14 +70,17 @@ export class FinnhubService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async subscribeToActiveSymbols() {
-    const grouped = await this.emaAlertService.getActiveAlertsGroupedBySymbolAndTimeframe()
-    const symbols = new Set<string>()
-    for (const key of grouped.keys()) {
-      symbols.add(key.split('_')[0])
+    const emaGrouped = await this.emaAlertService.getActiveAlertsGroupedBySymbolAndTimeframe()
+    const emaSymbols = new Set<string>()
+    for (const key of emaGrouped.keys()) {
+      emaSymbols.add(key.split('_')[0])
     }
 
+    const priceGrouped = await this.priceAlertService.getActiveAlertsGroupedBySymbol()
+    const allSymbols = new Set<string>([...emaSymbols, ...priceGrouped.keys()])
+
     const newSymbols: string[] = []
-    for (const symbol of symbols) {
+    for (const symbol of allSymbols) {
       if (!this.subscribedSymbols.has(symbol)) {
         const finnhubSymbol = this.toFinnhubSymbol(symbol)
         this.ws?.send(JSON.stringify({ type: 'subscribe', symbol: finnhubSymbol }))
@@ -114,6 +119,8 @@ export class FinnhubService implements OnModuleInit, OnModuleDestroy {
         const price: number = trade.p
         const timestamp: number = trade.t
 
+        this.checkPriceAlerts(symbol, price)
+
         for (const timeframe of ['5M', '30M']) {
           const completed = this.candleBuilder.processTick(symbol, timeframe, price, timestamp)
           if (completed) {
@@ -143,6 +150,17 @@ export class FinnhubService implements OnModuleInit, OnModuleDestroy {
       await this.telegramBot.sendMessageToUser(alert.chatId, message)
       this.logger.log(
         `[Finnhub] EMA alert #${alert.id} triggered — ${symbol} ${timeframe} ${cross.direction} for ${alert.chatId}`,
+      )
+    }
+  }
+
+  private async checkPriceAlerts(symbol: string, price: number) {
+    const triggered = await this.priceAlertService.checkTickAgainstAlerts(symbol, price)
+    for (const { alert, currentPrice } of triggered) {
+      const message = this.priceAlertService.buildAlertMessage(alert, currentPrice)
+      await this.telegramBot.sendMessageToUser(alert.chatId, message)
+      this.logger.log(
+        `[Finnhub] Price alert #${alert.userAlertId} triggered — ${symbol} ${alert.type} @ ${alert.targetPrice} for ${alert.chatId}`,
       )
     }
   }

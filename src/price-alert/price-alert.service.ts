@@ -202,6 +202,39 @@ export class PriceAlertService {
     return message
   }
 
+  // ── WebSocket: get all active alerts grouped by symbol ────────
+
+  async getActiveAlertsGroupedBySymbol(): Promise<Map<string, PriceAlert[]>> {
+    const active = await this.alertRepo.find({ where: { active: true } })
+    const grouped = new Map<string, PriceAlert[]>()
+    for (const alert of active) {
+      if (!grouped.has(alert.symbol)) grouped.set(alert.symbol, [])
+      grouped.get(alert.symbol)!.push(alert)
+    }
+    return grouped
+  }
+
+  // ── WebSocket: check a single tick against all alerts for a symbol
+
+  async checkTickAgainstAlerts(
+    symbol: string,
+    price: number,
+  ): Promise<Array<{ alert: PriceAlert; currentPrice: number }>> {
+    const active = await this.alertRepo.find({ where: { symbol, active: true } })
+    if (active.length === 0) return []
+
+    const triggered: Array<{ alert: PriceAlert; currentPrice: number }> = []
+
+    for (const alert of active) {
+      if (this.isTriggered(alert, price)) {
+        await this.alertRepo.update({ id: alert.id }, { active: false })
+        triggered.push({ alert, currentPrice: price })
+      }
+    }
+
+    return triggered
+  }
+
   // ── Daily cleanup: cancel all active alerts system-wide ───────
 
   async cancelAllAlertsForAllUsers(): Promise<Map<string, { priceCount: number }>> {
