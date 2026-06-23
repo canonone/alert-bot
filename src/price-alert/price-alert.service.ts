@@ -219,6 +219,7 @@ export class PriceAlertService {
   async checkTickAgainstAlerts(
     symbol: string,
     price: number,
+    previousPrice: number | null,
   ): Promise<Array<{ alert: PriceAlert; currentPrice: number }>> {
     const active = await this.alertRepo.find({ where: { symbol, active: true } })
     if (active.length === 0) return []
@@ -226,7 +227,7 @@ export class PriceAlertService {
     const triggered: Array<{ alert: PriceAlert; currentPrice: number }> = []
 
     for (const alert of active) {
-      if (this.isTriggered(alert, price)) {
+      if (this.isTriggered(alert, price, previousPrice)) {
         await this.alertRepo.update({ id: alert.id }, { active: false })
         triggered.push({ alert, currentPrice: price })
       }
@@ -283,7 +284,7 @@ export class PriceAlertService {
         continue
       }
 
-      if (this.isTriggered(alert, currentPrice)) {
+      if (this.isTriggered(alert, currentPrice, null)) {
         await this.alertRepo.update({ id: alert.id }, { active: false })
         triggered.push({ alert, currentPrice })
         this.logger.log(
@@ -297,15 +298,26 @@ export class PriceAlertService {
 
   // ── Alert trigger logic ───────────────────────────────────────
 
-  isTriggered(alert: PriceAlert, currentPrice: number): boolean {
+  isTriggered(alert: PriceAlert, currentPrice: number, previousPrice: number | null): boolean {
     switch (alert.type) {
       case 'SL':
         return currentPrice <= Number(alert.targetPrice)
       case 'TP':
         return currentPrice >= Number(alert.targetPrice)
       case 'TARGET': {
-        const tolerance = Number(alert.targetPrice) * 0.0005 // 0.05% tolerance
-        return Math.abs(currentPrice - Number(alert.targetPrice)) <= tolerance
+        const target = Number(alert.targetPrice)
+        const pipSize = alert.symbol.includes('JPY') ? 0.01 : 0.0001
+        const tolerance = pipSize
+
+        if (Math.abs(currentPrice - target) <= tolerance) return true
+
+        if (previousPrice !== null) {
+          const crossedUp = previousPrice < target && currentPrice >= target
+          const crossedDown = previousPrice > target && currentPrice <= target
+          if (crossedUp || crossedDown) return true
+        }
+
+        return false
       }
     }
   }

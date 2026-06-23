@@ -9,6 +9,7 @@ export class FinnhubPriceService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(FinnhubPriceService.name)
   private ws: WebSocket | null = null
   private readonly subscribedSymbols = new Set<string>()
+  private readonly lastPrice = new Map<string, number>()
   private reconnectAttempts = 0
   private readonly maxReconnectAttempts = 10
   private readonly finnhubApiKey: string
@@ -101,15 +102,17 @@ export class FinnhubPriceService implements OnModuleInit, OnModuleDestroy {
       for (const trade of parsed.data ?? []) {
         const symbol = this.fromFinnhubSymbol(trade.s)
         const price: number = trade.p
-        this.checkPriceAlerts(symbol, price)
+        const previousPrice = this.lastPrice.get(symbol) ?? null
+        this.lastPrice.set(symbol, price)
+        this.checkPriceAlerts(symbol, price, previousPrice)
       }
     } else if (parsed.type === 'error') {
       this.logger.error(`[FinnhubPrice] API error: ${parsed.msg}`)
     }
   }
 
-  private async checkPriceAlerts(symbol: string, price: number) {
-    const triggered = await this.priceAlertService.checkTickAgainstAlerts(symbol, price)
+  private async checkPriceAlerts(symbol: string, price: number, previousPrice: number | null) {
+    const triggered = await this.priceAlertService.checkTickAgainstAlerts(symbol, price, previousPrice)
     for (const { alert, currentPrice } of triggered) {
       const message = this.priceAlertService.buildAlertMessage(alert, currentPrice)
       await this.telegramBot.sendMessageToUser(alert.chatId, message)
