@@ -78,7 +78,12 @@ export class UsersService {
   }
 
   async resetAllAlertIdCounters(): Promise<void> {
-    await this.userRepo.update({}, { alertIdCounter: 0 })
+    await this.userRepo
+      .createQueryBuilder()
+      .update()
+      .set({ alertIdCounter: 0 })
+      .where('1=1')
+      .execute()
   }
 
   // ── Check admin ───────────────────────────────────────────────

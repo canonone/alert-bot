@@ -1,7 +1,6 @@
 import { Injectable, Logger, Inject, forwardRef } from '@nestjs/common'
 import { Cron } from '@nestjs/schedule'
 import { PriceAlertService } from '../price-alert/price-alert.service'
-import { EmaAlertService } from '../ema-alert/ema-alert.service'
 import { TelegramBotService } from '../telegram-bot/telegram-bot.service'
 import { UsersService } from '../users/users.service'
 
@@ -12,8 +11,6 @@ export class DailyCleanupCron {
   constructor(
     @Inject(forwardRef(() => PriceAlertService))
     private readonly priceAlertService: PriceAlertService,
-    @Inject(forwardRef(() => EmaAlertService))
-    private readonly emaAlertService: EmaAlertService,
     @Inject(forwardRef(() => TelegramBotService))
     private readonly telegramBot: TelegramBotService,
     private readonly usersService: UsersService,
@@ -24,34 +21,26 @@ export class DailyCleanupCron {
     this.logger.log('[DailyCleanup] Running daily alert cleanup at 10 PM WAT')
 
     const priceCounts = await this.priceAlertService.cancelAllAlertsForAllUsers()
-    const emaCounts = await this.emaAlertService.cancelAllAlertsForAllUsers()
-
-    const allChatIds = new Set([...priceCounts.keys(), ...emaCounts.keys()])
     let totalCancelled = 0
 
-    for (const chatId of allChatIds) {
-      const priceCount = priceCounts.get(chatId)?.priceCount ?? 0
-      const emaCount = emaCounts.get(chatId)?.emaCount ?? 0
-      const total = priceCount + emaCount
+    for (const [chatId, { priceCount }] of priceCounts) {
+      totalCancelled += priceCount
 
-      totalCancelled += total
-
-      if (total > 0) {
+      if (priceCount > 0) {
         const message =
           `🌙 <b>Daily Alert Cleanup</b>\n\n` +
           `All your active alerts have been automatically cancelled for end of day.\n\n` +
           `━━━━━━━━━━━━━━━━━━━━\n` +
           `🔔 Price alerts cancelled: ${priceCount}\n` +
-          `📈 EMA alerts cancelled: ${emaCount}\n` +
           `━━━━━━━━━━━━━━━━━━━━\n` +
-          `<i>Set new alerts tomorrow with /setalert or /ema</i>`
+          `<i>Set new alerts tomorrow with /setalert</i>`
 
         await this.telegramBot.sendMessageToUser(chatId, message)
       }
     }
 
     this.logger.log(
-      `[DailyCleanup] Total alerts cancelled: ${totalCancelled} across ${allChatIds.size} user(s)`,
+      `[DailyCleanup] Total alerts cancelled: ${totalCancelled} across ${priceCounts.size} user(s)`,
     )
   }
 

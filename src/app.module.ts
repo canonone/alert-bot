@@ -8,12 +8,10 @@ import { PriceAlertModule } from './price-alert/price-alert.module'
 import { TelegramBotModule } from './telegram-bot/telegram-bot.module'
 import { LotSizeModule } from './lot-size/lot-size.module'
 import { InviteModule } from './invite/invite.module'
-import { EmaAlertModule } from './ema-alert/ema-alert.module'
 import { ScheduleModule } from './schedule/schedule.module'
 import { User } from './users/user.entity'
 import { PriceAlert } from './price-alert/price-alert.entity'
 import { InviteCode } from './invite/invite-code.entity'
-import { EmaAlert } from './ema-alert/ema-alert.entity'
 
 @Module({
   imports: [
@@ -28,7 +26,7 @@ import { EmaAlert } from './ema-alert/ema-alert.entity'
         username: config.getOrThrow('DB_USERNAME'),
         password: config.getOrThrow('DB_PASSWORD'),
         database: config.getOrThrow('DB_NAME'),
-        entities: [User, PriceAlert, InviteCode, EmaAlert],
+        entities: [User, PriceAlert, InviteCode],
         synchronize: true,
         logging: config.get('NODE_ENV') === 'development',
       }),
@@ -38,7 +36,6 @@ import { EmaAlert } from './ema-alert/ema-alert.entity'
     LotSizeModule,
     PriceAlertModule,
     InviteModule,
-    EmaAlertModule,
     ScheduleModule,
     TelegramBotModule,
   ],
