@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy, Inject, forwardRef } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
-import * as WebSocket from 'ws'
+import WebSocket = require('ws')
 import { PriceAlertService } from './price-alert.service'
 import { TelegramBotService } from '../telegram-bot/telegram-bot.service'
 
@@ -65,20 +65,26 @@ export class FinnhubPriceService implements OnModuleInit, OnModuleDestroy {
 
   private async subscribeToActiveSymbols() {
     const grouped = await this.priceAlertService.getActiveAlertsGroupedBySymbol()
-    const symbols: string[] = []
 
-    for (const symbol of grouped.keys()) {
-      const finnhubSymbol = this.toFinnhubSymbol(symbol)
-      this.ws?.send(JSON.stringify({ type: 'subscribe', symbol: finnhubSymbol }))
-      this.subscribedSymbols.add(symbol)
-      symbols.push(finnhubSymbol)
-    }
-
-    if (symbols.length > 0) {
-      this.logger.log(`[FinnhubPrice] Subscribed to: ${symbols.join(', ')}`)
-    } else {
+    if (grouped.size === 0) {
       this.logger.log('[FinnhubPrice] No active symbols to subscribe')
+      return
     }
+
+    const entries = Array.from(grouped.keys()).map((symbol) => ({
+      symbol,
+      finnhubSymbol: this.toFinnhubSymbol(symbol),
+    }))
+
+    entries.forEach(({ symbol, finnhubSymbol }, index) => {
+      setTimeout(() => {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({ type: 'subscribe', symbol: finnhubSymbol }))
+          this.subscribedSymbols.add(symbol)
+          this.logger.log(`[FinnhubPrice] Subscribed to: ${finnhubSymbol}`)
+        }
+      }, index * 200)
+    })
   }
 
   subscribeToSymbol(symbol: string) {
