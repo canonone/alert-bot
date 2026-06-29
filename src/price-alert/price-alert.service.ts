@@ -306,18 +306,14 @@ export class PriceAlertService {
         return currentPrice >= Number(alert.targetPrice)
       case 'TARGET': {
         const target = Number(alert.targetPrice)
-        const pipSize = alert.symbol.includes('JPY') ? 0.01 : 0.0001
-        const tolerance = pipSize
-
-        if (Math.abs(currentPrice - target) <= tolerance) return true
 
         if (previousPrice !== null) {
           const crossedUp = previousPrice < target && currentPrice >= target
           const crossedDown = previousPrice > target && currentPrice <= target
-          if (crossedUp || crossedDown) return true
+          return crossedUp || crossedDown
         }
 
-        return false
+        return currentPrice === target
       }
     }
   }
