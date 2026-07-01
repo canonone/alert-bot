@@ -53,6 +53,35 @@ export class PriceAlertService {
       }
     }
 
+    if (type === 'SL' || type === 'TP') {
+      const user = await this.usersService.findByChatId(chatId)
+      if (user?.twelveDataApiKey) {
+        const { price: currentPrice } = await this.marketData.getCurrentPrice(upperSymbol, user.twelveDataApiKey)
+        if (currentPrice !== null) {
+          if (type === 'SL' && currentPrice <= targetPrice) {
+            return {
+              success: false,
+              message:
+                `❌ <b>Invalid SL Level</b>\n\n` +
+                `Your SL (${targetPrice}) is at or above the current price (${currentPrice}).\n\n` +
+                `SL must be set BELOW current price.\n\n` +
+                `Current price: <b>${currentPrice}</b>`,
+            }
+          }
+          if (type === 'TP' && currentPrice >= targetPrice) {
+            return {
+              success: false,
+              message:
+                `❌ <b>Invalid TP Level</b>\n\n` +
+                `Your TP (${targetPrice}) is at or below the current price (${currentPrice}).\n\n` +
+                `TP must be set ABOVE current price.\n\n` +
+                `Current price: <b>${currentPrice}</b>`,
+            }
+          }
+        }
+      }
+    }
+
     const userAlertId = await this.usersService.getNextAlertId(chatId)
 
     const alert = this.alertRepo.create({
