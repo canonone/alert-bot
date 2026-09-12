@@ -8,7 +8,9 @@ Use this to confirm the synthetic bars close at 02/06/10/14/18/22 UTC (03/07/11/
 matching FOREX.com/TradingView, while the native ones are visibly 1 hour off.
 
 Usage:
-    python -m scripts.inspect_4h_candles [PAIR]   # PAIR defaults to XAUUSD
+    python -m scripts.inspect_4h_candles [PAIR] [HOURS_BACK]
+    # PAIR defaults to XAUUSD, HOURS_BACK defaults to 24
+    # e.g. python -m scripts.inspect_4h_candles XAUUSD 150   (~6 days, reaches past a weekend)
 """
 
 import asyncio
@@ -27,6 +29,7 @@ from app.services.retracement_zone_service import (
 
 async def main() -> None:
     pair = sys.argv[1].upper() if len(sys.argv) > 1 else "XAUUSD"
+    hours_back = int(sys.argv[2]) if len(sys.argv) > 2 else ONE_H_BOUNDARY_SAMPLE_SIZE
 
     if not config.TWELVE_DATA_API_KEY:
         print("TWELVE_DATA_API_KEY is not set in .env — cannot inspect live data.")
@@ -34,7 +37,10 @@ async def main() -> None:
 
     market_data = MarketDataService()
 
-    native, quota_exceeded = await market_data.get_candles(pair, "4h", config.TWELVE_DATA_API_KEY, outputsize=8)
+    native_outputsize = max(8, hours_back // 4)
+    native, quota_exceeded = await market_data.get_candles(
+        pair, "4h", config.TWELVE_DATA_API_KEY, outputsize=native_outputsize
+    )
     if quota_exceeded:
         print("Twelve Data quota exceeded — try again later.")
         return
@@ -46,7 +52,7 @@ async def main() -> None:
         print(f"  {c['datetime']:%Y-%m-%d %H:%M} UTC   O:{c['open']:<10} H:{c['high']:<10} L:{c['low']:<10} C:{c['close']:<10}")
 
     hourly, quota_exceeded = await market_data.get_candles(
-        pair, "1h", config.TWELVE_DATA_API_KEY, outputsize=ONE_H_BOUNDARY_SAMPLE_SIZE
+        pair, "1h", config.TWELVE_DATA_API_KEY, outputsize=hours_back
     )
     if quota_exceeded:
         print("\nTwelve Data quota exceeded on 1H fetch — try again later.")
