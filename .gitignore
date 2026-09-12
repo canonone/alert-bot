@@ -4,15 +4,17 @@
 .env.production
 
 # Dependencies
-node_modules/
-
-# Build output
-dist/
+.venv/
+__pycache__/
+*.pyc
 
 # Logs
 *.log
-npm-debug.log*
 
 # OS
 .DS_Store
 Thumbs.db
+
+.claude
+.venv
+.vscode

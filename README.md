@@ -14,7 +14,9 @@ Multi-user Forex price alert bot with lot size calculator, powered by Telegram +
 
 ### 1. Clone & install
 ```bash
-npm install
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ### 2. Create your `.env` file
@@ -25,6 +27,7 @@ cp .env.example .env
 Fill in:
 ```env
 TELEGRAM_BOT_TOKEN=your-bot-token-here   # from @BotFather
+ADMIN_CHAT_ID=your-telegram-chat-id
 DB_HOST=localhost
 DB_PORT=5432
 DB_USERNAME=postgres
@@ -32,6 +35,7 @@ DB_PASSWORD=yourpassword
 DB_NAME=price_alert_bot
 PORT=3000
 NODE_ENV=development
+FINNHUB_API_KEY=your-finnhub-api-key-here
 ```
 
 ### 3. Create a Telegram bot
@@ -46,15 +50,10 @@ CREATE DATABASE price_alert_bot;
 
 ### 5. Run the bot
 ```bash
-# Development
-npm run start:dev
-
-# Production
-npm run build
-npm run start:prod
+python -m app.main
 ```
 
-Tables are created automatically on first run (`synchronize: true`).
+Tables are created automatically on first run.
 
 ---
 
@@ -87,7 +86,7 @@ Tables are created automatically on first run (`synchronize: true`).
 ### Alert Types
 - `SL` — fires when price drops to level
 - `TP` — fires when price rises to level
-- `TARGET` — fires when price touches level (0.05% tolerance)
+- `TARGET` — fires when price crosses through the level (real-time tick feed)
 
 ### Lot Size Examples
 ```
@@ -102,13 +101,27 @@ Tables are created automatically on first run (`synchronize: true`).
 ## Architecture
 
 ```
-src/
-├── users/              # User registration + API key storage
-├── market-data/        # Twelve Data price fetching (per-user key)
-├── lot-size/           # Lot size calculation engine
-├── price-alert/        # Alert CRUD + 15-min cron checker
-└── telegram-bot/       # All bot commands + message routing
+app/
+├── services/
+│   ├── users_service.py           # User registration + API key storage
+│   ├── market_data_service.py     # Twelve Data price fetching (per-user key)
+│   ├── lot_size_service.py        # Lot size calculation engine
+│   ├── price_alert_service.py     # Alert CRUD + trigger logic
+│   ├── invite_service.py          # Invite-code generation/redemption
+│   └── finnhub_price_service.py   # Live Finnhub WebSocket feed
+├── telegram_bot.py                # All bot commands + message routing
+├── webhook.py                     # FastAPI app exposing POST /webhook/<token> (production only)
+├── scheduler.py                   # Daily cleanup + alert-ID reset jobs
+├── db.py / models.py              # SQLAlchemy async models + engine
+├── config.py                      # Environment variable loading
+└── main.py                        # Entrypoint — polling (dev) / FastAPI+uvicorn webhook (prod)
 ```
+
+Built on `python-telegram-bot` (async; owns update handling and, in dev, polling),
+FastAPI + uvicorn (owns the HTTP server for the production webhook endpoint — PTB
+just consumes updates handed to it, it doesn't run its own web server),
+SQLAlchemy 2.0 async ORM + `asyncpg` for Postgres, `httpx` for Twelve Data REST calls,
+and `websockets` for the live Finnhub feed.
 
 ---
 
@@ -118,6 +131,5 @@ src/
 2. Create new Railway project → Deploy from GitHub
 3. Add PostgreSQL plugin
 4. Set environment variables in Railway dashboard
-5. Deploy
-
-Railway auto-detects NestJS and runs `npm run start:prod`.
+5. Set the start command to `python -m app.main`
+6. Deploy
