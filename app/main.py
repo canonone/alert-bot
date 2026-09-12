@@ -8,9 +8,9 @@ from app import config, scheduler
 from app.db import init_db
 from app.services.finnhub_price_service import FinnhubPriceService
 from app.services.invite_service import InviteService
-from app.services.lot_size_service import LotSizeService
 from app.services.market_data_service import MarketDataService
 from app.services.price_alert_service import PriceAlertService
+from app.services.retracement_zone_service import RetracementZoneService
 from app.services.users_service import UsersService
 from app.telegram_bot import TelegramBotService
 from app.webhook import create_webhook_app
@@ -26,20 +26,33 @@ def build_services() -> tuple[TelegramBotService, FinnhubPriceService]:
     market_data = MarketDataService()
     users_service = UsersService()
     price_alert_service = PriceAlertService(market_data, users_service)
-    lot_size_service = LotSizeService(market_data)
     invite_service = InviteService()
 
     telegram_bot_service = TelegramBotService(
         users_service=users_service,
         price_alert_service=price_alert_service,
-        lot_size_service=lot_size_service,
         market_data=market_data,
         invite_service=invite_service,
     )
 
+    retracement_zone_service: RetracementZoneService | None = None
+    if config.TWELVE_DATA_API_KEY:
+        retracement_zone_service = RetracementZoneService(
+            api_key=config.TWELVE_DATA_API_KEY,
+            pairs=config.RETRACEMENT_ZONE_PAIRS,
+            market_data=market_data,
+            users_service=users_service,
+            send_message=telegram_bot_service.send_message_to_user,
+        )
+    else:
+        logger.warning("TWELVE_DATA_API_KEY not set — 4H retracement zone feature disabled")
+    telegram_bot_service.retracement_zone_service = retracement_zone_service
+
     finnhub_price_service = FinnhubPriceService(
         price_alert_service=price_alert_service,
         send_message=telegram_bot_service.send_message_to_user,
+        retracement_zone_service=retracement_zone_service,
+        extra_symbols=set(config.RETRACEMENT_ZONE_PAIRS) if retracement_zone_service else set(),
     )
     telegram_bot_service.finnhub_price_service = finnhub_price_service
 
@@ -61,12 +74,15 @@ async def _start_common(
     finnhub_price_service: FinnhubPriceService,
 ) -> None:
     await init_db()
+    if telegram_bot_service.retracement_zone_service is not None:
+        await telegram_bot_service.retracement_zone_service.bootstrap()
     finnhub_price_service.start()
     scheduler.register_jobs(
         application,
         price_alert_service=telegram_bot_service.price_alert_service,
         telegram_bot=telegram_bot_service,
         users_service=telegram_bot_service.users_service,
+        retracement_zone_service=telegram_bot_service.retracement_zone_service,
     )
 
 

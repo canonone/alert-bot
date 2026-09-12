@@ -5,7 +5,6 @@ from telegram import Bot, Update
 from telegram.ext import ContextTypes
 
 from app.services.invite_service import InviteService
-from app.services.lot_size_service import LotSizeService
 from app.services.market_data_service import MarketDataService
 from app.services.price_alert_service import PriceAlertService
 from app.services.users_service import UsersService
@@ -18,19 +17,18 @@ class TelegramBotService:
         self,
         users_service: UsersService,
         price_alert_service: PriceAlertService,
-        lot_size_service: LotSizeService,
         market_data: MarketDataService,
         invite_service: InviteService,
     ) -> None:
         self.users_service = users_service
         self.price_alert_service = price_alert_service
-        self.lot_size_service = lot_size_service
         self.market_data = market_data
         self.invite_service = invite_service
 
         # Wired up after construction in main.py (avoids circular imports)
         self.bot: Bot | None = None
         self.finnhub_price_service: Any = None
+        self.retracement_zone_service: Any = None
 
     # ── PTB entrypoint ────────────────────────────────────────────
 
@@ -102,12 +100,14 @@ class TelegramBotService:
             await self._handle_cancelalert(chat_id, parts)
         elif command == "/cancelalerts":
             await self._handle_cancelalerts(chat_id, parts)
-        elif command == "/lotsize":
-            await self._handle_lotsize(chat_id, parts)
         elif command == "/price":
             await self._handle_price(chat_id, parts)
         elif command == "/pairs":
             await self._handle_pairs(chat_id)
+        elif command == "/xauzone":
+            await self._handle_xauzone(chat_id, parts)
+        elif command == "/zonealerts":
+            await self._handle_zonealerts(chat_id, parts)
 
     # ── /start ────────────────────────────────────────────────────
 
@@ -245,7 +245,6 @@ class TelegramBotService:
             "━━━━━━━━━━━━━━━━━━━━\n"
             "<b>Try these commands:</b>\n\n"
             "📊 <code>/setalert GBPUSD SL 1.2700</code>\n"
-            "📦 <code>/lotsize GBPUSD 50 20</code>\n"
             "💰 <code>/price EURUSD</code>\n"
             "📋 /help — all commands",
         )
@@ -344,38 +343,6 @@ class TelegramBotService:
             _, message = await self.price_alert_service.cancel_alerts_by_symbol(chat_id, parts[1])
         await self.send_message_to_user(chat_id, message)
 
-    # ── /lotsize ──────────────────────────────────────────────────
-
-    async def _handle_lotsize(self, chat_id: str, parts: list[str]) -> None:
-        user = await self.users_service.find_by_chat_id(chat_id)
-        if not user or not user.is_setup:
-            await self._send_setup_prompt(chat_id)
-            return
-
-        if len(parts) != 4:
-            await self.send_message_to_user(
-                chat_id,
-                "❌ <b>Invalid format</b>\n\n"
-                "Usage: <code>/lotsize [PAIR] [RISK$] [SL PIPS]</code>\n\n"
-                "Examples:\n"
-                "<code>/lotsize GBPUSD 50 20</code>\n"
-                "<code>/lotsize EURJPY 100 30</code>\n"
-                "<code>/lotsize XAUUSD 200 15</code>",
-            )
-            return
-
-        pair = parts[1]
-        try:
-            risk_usd = float(parts[2])
-            sl_pips = float(parts[3])
-        except ValueError:
-            await self.send_message_to_user(chat_id, "❌ Risk and SL pips must be valid numbers.")
-            return
-
-        await self.send_message_to_user(chat_id, "🔄 Fetching live rate...")
-        result = await self.lot_size_service.calculate(pair, risk_usd, sl_pips, user.twelve_data_api_key)
-        await self.send_message_to_user(chat_id, result.message)
-
     # ── /price ────────────────────────────────────────────────────
 
     async def _handle_price(self, chat_id: str, parts: list[str]) -> None:
@@ -402,7 +369,32 @@ class TelegramBotService:
     # ── /pairs ────────────────────────────────────────────────────
 
     async def _handle_pairs(self, chat_id: str) -> None:
-        await self.send_message_to_user(chat_id, self.lot_size_service.get_supported_pairs_message())
+        await self.send_message_to_user(chat_id, self.price_alert_service.get_supported_pairs_message())
+
+    # ── /xauzone ──────────────────────────────────────────────────
+
+    async def _handle_xauzone(self, chat_id: str, parts: list[str]) -> None:
+        if self.retracement_zone_service is None:
+            await self.send_message_to_user(chat_id, "❌ The 4H zone feature is not configured on this server.")
+            return
+        pair = parts[1].upper() if len(parts) >= 2 else "XAUUSD"
+        await self.send_message_to_user(chat_id, self.retracement_zone_service.get_status_message(pair))
+
+    # ── /zonealerts ───────────────────────────────────────────────
+
+    async def _handle_zonealerts(self, chat_id: str, parts: list[str]) -> None:
+        if self.retracement_zone_service is None:
+            await self.send_message_to_user(chat_id, "❌ The 4H zone feature is not configured on this server.")
+            return
+        if len(parts) != 2 or parts[1].lower() not in ("on", "off"):
+            await self.send_message_to_user(
+                chat_id, "❌ Usage: <code>/zonealerts on</code> or <code>/zonealerts off</code>"
+            )
+            return
+        enabled = parts[1].lower() == "on"
+        await self.users_service.set_zone_alerts_enabled(chat_id, enabled)
+        status = "enabled ✅" if enabled else "disabled ❌"
+        await self.send_message_to_user(chat_id, f"4H zone alerts {status}.")
 
     # ── /help ─────────────────────────────────────────────────────
 
@@ -423,12 +415,13 @@ class TelegramBotService:
             "<code>/cancelalert [ID]</code>\n"
             "<code>/cancelalerts [SYMBOL or all]</code>\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>📦 Lot Size</b>\n\n"
-            "<code>/lotsize [PAIR] [RISK$] [SL PIPS]</code>\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
             "<b>📊 Market</b>\n\n"
             "<code>/price [PAIR]</code>\n"
             "<code>/pairs</code>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>🟡 4H Zones</b>\n\n"
+            "<code>/xauzone [PAIR]</code> — current zone status (default XAUUSD)\n"
+            "<code>/zonealerts [on|off]</code> — zone alert notifications\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "🔴 SL · 🟢 TP · 🎯 TARGET\n"
             "Real-time price alerts via live feed ⚡"

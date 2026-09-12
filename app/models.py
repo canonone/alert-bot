@@ -7,6 +7,7 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -39,6 +40,9 @@ class User(Base):
 
     alert_id_counter: Mapped[int] = mapped_column(Integer, default=0)
 
+    # Opt-in flag for 4H retracement-zone notifications (see RetracementZoneService)
+    zone_alerts_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -62,6 +66,33 @@ class PriceAlert(Base):
 
     user_alert_id: Mapped[int] = mapped_column(Integer, default=0)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RetracementZone(Base):
+    __tablename__ = "retracement_zones"
+    __table_args__ = (UniqueConstraint("pair", "candle_start_utc", name="uq_retracement_zone_pair_candle"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    pair: Mapped[str] = mapped_column(String, index=True)
+
+    candle_start_utc: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+    candle_end_utc: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+
+    open: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
+    high: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
+    low: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
+    close: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
+
+    bias: Mapped[str] = mapped_column(String)  # "bullish" | "bearish" | "neutral"
+    range: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
+    level_50: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
+
+    zone_entry_triggered: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Also set True (at creation) for "neutral" candles, which have no valid zone to monitor
+    invalidated: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

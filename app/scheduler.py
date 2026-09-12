@@ -1,5 +1,6 @@
 import datetime
 import logging
+from typing import Any
 
 from telegram.ext import Application, ContextTypes
 
@@ -15,6 +16,7 @@ def register_jobs(
     price_alert_service: PriceAlertService,
     telegram_bot: TelegramBotService,
     users_service: UsersService,
+    retracement_zone_service: Any = None,
 ) -> None:
     async def run_daily_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("[DailyCleanup] Running daily alert cleanup at 10 PM WAT")
@@ -50,3 +52,14 @@ def register_jobs(
     application.job_queue.run_daily(
         reset_alert_id_counters, time=datetime.time(hour=23, tzinfo=datetime.timezone.utc)
     )
+
+    if retracement_zone_service is not None:
+        async def poll_retracement_zones(context: ContextTypes.DEFAULT_TYPE) -> None:
+            await retracement_zone_service.poll_all_pairs()
+
+        # We deliberately poll rather than schedule at a hardcoded 4H boundary: the true
+        # boundary alignment can only be confirmed by inspecting live Twelve Data output
+        # (see RetracementZoneService._log_boundary_alignment / scripts/inspect_4h_candles.py),
+        # and polling detects a new closed candle regardless of that alignment.
+        application.job_queue.run_repeating(poll_retracement_zones, interval=300, first=60)
+        logger.info("[Scheduler] 4H retracement-zone polling job registered (every 5 min)")

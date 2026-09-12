@@ -1,3 +1,4 @@
+import datetime
 import logging
 
 import httpx
@@ -119,3 +120,58 @@ class MarketDataService:
         except Exception as error:
             logger.error(f"Batch price fetch failed: {error}")
             return {}, False
+
+    # ── Get recent OHLC candles (used by the 4H retracement-zone feature) ──
+    # Returns (candles, quota_exceeded). Each candle: {datetime (aware UTC), open, high, low, close}.
+    # Sorted oldest-first regardless of the order Twelve Data returns them in.
+
+    async def get_candles(
+        self, symbol: str, interval: str, api_key: str, outputsize: int = 2
+    ) -> tuple[list[dict], bool]:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    f"{BASE_URL}/time_series",
+                    params={
+                        "symbol": self._format_symbol(symbol),
+                        "interval": interval,
+                        "outputsize": outputsize,
+                        "timezone": "UTC",
+                        "apikey": api_key,
+                    },
+                )
+            data = response.json()
+
+            if isinstance(data, dict) and data.get("status") == "error":
+                if self.is_quota_error(data):
+                    return [], True
+                logger.error(f"Twelve Data time_series error for {symbol}: {data.get('message')}")
+                return [], False
+
+            raw_values = data.get("values") if isinstance(data, dict) else None
+            if not raw_values:
+                return [], False
+
+            candles: list[dict] = []
+            for value in raw_values:
+                try:
+                    dt = datetime.datetime.strptime(value["datetime"], "%Y-%m-%d %H:%M:%S").replace(
+                        tzinfo=datetime.timezone.utc
+                    )
+                    candles.append(
+                        {
+                            "datetime": dt,
+                            "open": float(value["open"]),
+                            "high": float(value["high"]),
+                            "low": float(value["low"]),
+                            "close": float(value["close"]),
+                        }
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+            candles.sort(key=lambda c: c["datetime"])
+            return candles, False
+        except Exception as error:
+            logger.error(f"Failed to fetch candles for {symbol}: {error}")
+            return [], False

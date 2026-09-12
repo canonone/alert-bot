@@ -100,3 +100,17 @@ class UsersService:
 
     def is_admin_chat_id(self, chat_id: str) -> bool:
         return chat_id == self.admin_chat_id
+
+    # ── 4H retracement-zone alert opt-in ───────────────────────────
+
+    async def set_zone_alerts_enabled(self, chat_id: str, enabled: bool) -> None:
+        async with SessionLocal() as session:
+            await session.execute(update(User).where(User.chat_id == chat_id).values(zone_alerts_enabled=enabled))
+            await session.commit()
+
+    async def find_zone_alert_subscribers(self) -> list[User]:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(User).where(User.zone_alerts_enabled.is_(True), User.is_approved.is_(True))
+            )
+            return list(result.scalars().all())

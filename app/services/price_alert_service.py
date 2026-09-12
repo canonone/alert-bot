@@ -354,3 +354,8 @@ class PriceAlertService:
 
     def get_emoji(self, type_: str) -> str:
         return {"SL": "🔴", "TP": "🟢", "TARGET": "🎯"}[type_]
+
+    # ── Supported pairs list message ──────────────────────────────
+
+    def get_supported_pairs_message(self) -> str:
+        return f"📋 <b>Supported Pairs</b>\n\n{' • '.join(sorted(ALLOWED_SYMBOLS))}"
