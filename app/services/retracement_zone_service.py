@@ -14,14 +14,69 @@ logger = logging.getLogger("RetracementZoneService")
 
 SendMessage = Callable[[str, str], Awaitable[None]]
 
-CANDLE_INTERVAL = "4h"
-BOUNDARY_SAMPLE_SIZE = 6  # how many candles to pull when logging the observed boundary alignment
-POLL_LOOKBACK = 2  # candles fetched on every routine poll — just enough to see the latest closed one
+# Twelve Data's native `interval=4h` endpoint closes bars at 01/05/09/13/17/21:00 UTC — one hour
+# off the user's real broker feed (FOREX.com, viewed on TradingView), confirmed by comparing
+# real chart timestamps against a manually-drawn line on a live trade. FOREX.com's 4H bars close
+# at 03/07/11/15/19/23:00 WAT (UTC+1) = 02/06/10/14/18/22:00 UTC. Twelve Data can't be parameterized
+# to that boundary directly, so instead we build synthetic 4H bars by aggregating four consecutive
+# 1H candles — 1H bars are always hour-aligned, so this reproduces the correct boundary exactly.
+#
+# Per-pair override lives in PAIR_FOUR_H_BOUNDARY_HOURS_UTC — if a future pair trades through a
+# broker/feed with a different alignment, add it there; nothing else needs to change.
+DEFAULT_FOUR_H_BOUNDARY_HOURS_UTC = [2, 6, 10, 14, 18, 22]
+PAIR_FOUR_H_BOUNDARY_HOURS_UTC: dict[str, list[int]] = {}
+
+ONE_H_INTERVAL = "1h"
+ONE_H_BOUNDARY_SAMPLE_SIZE = 24  # ~1 day of 1H candles, logged once on bootstrap for verification
+ONE_H_POLL_LOOKBACK = 10  # comfortably covers the last 2 full synthetic 4H buckets on every poll
 
 
 def _to_wat(dt: datetime.datetime) -> datetime.datetime:
     # Matches the WAT formatting convention in price_alert_service.build_alert_message
     return dt.astimezone(datetime.timezone.utc) + datetime.timedelta(hours=1)
+
+
+def _boundary_hours_for(pair: str) -> list[int]:
+    return PAIR_FOUR_H_BOUNDARY_HOURS_UTC.get(pair, DEFAULT_FOUR_H_BOUNDARY_HOURS_UTC)
+
+
+def _bucket_start(dt: datetime.datetime, boundary_hours: list[int]) -> datetime.datetime:
+    # Boundary hours are spaced exactly 4 apart, so they share one value mod 4 — that value is
+    # also the hour every synthetic bucket starts on (start = close - 4h, and -4 ≡ 0 mod 4).
+    offset = boundary_hours[0] % 4
+    hour_start = dt.replace(minute=0, second=0, microsecond=0)
+    shift = (hour_start.hour - offset) % 4
+    return hour_start - datetime.timedelta(hours=shift)
+
+
+def _aggregate_1h_to_4h(candles_1h: list[dict], boundary_hours: list[int]) -> list[dict]:
+    """Groups closed, hour-aligned 1H candles (oldest-first) into synthetic 4H bars.
+
+    A bucket is only emitted once all 4 of its constituent hourly candles are present and
+    contiguous — a bucket straddling a weekend close/open (or any data gap) is simply skipped,
+    which is what "closed" and "market closed" mean here in the absence of a native 4H bar.
+    """
+    buckets: dict[datetime.datetime, list[dict]] = {}
+    for candle in candles_1h:
+        start = _bucket_start(candle["datetime"], boundary_hours)
+        buckets.setdefault(start, []).append(candle)
+
+    aggregated: list[dict] = []
+    for start in sorted(buckets):
+        members = sorted(buckets[start], key=lambda c: c["datetime"])
+        expected_hours = [start + datetime.timedelta(hours=i) for i in range(4)]
+        if [m["datetime"] for m in members] != expected_hours:
+            continue
+        aggregated.append(
+            {
+                "datetime": start,
+                "open": members[0]["open"],
+                "close": members[-1]["close"],
+                "high": max(m["high"] for m in members),
+                "low": min(m["low"] for m in members),
+            }
+        )
+    return aggregated
 
 
 @dataclass
@@ -104,29 +159,32 @@ class RetracementZoneService:
                 logger.error(f"[RetracementZone] Poll failed for {pair}: {error}")
 
     async def _refresh_pair(self, pair: str, log_boundary: bool = False) -> None:
-        outputsize = BOUNDARY_SAMPLE_SIZE if log_boundary else POLL_LOOKBACK
-        candles, quota_exceeded = await self.market_data.get_candles(
-            pair, CANDLE_INTERVAL, self.api_key, outputsize=outputsize
+        outputsize = ONE_H_BOUNDARY_SAMPLE_SIZE if log_boundary else ONE_H_POLL_LOOKBACK
+        candles_1h, quota_exceeded = await self.market_data.get_candles(
+            pair, ONE_H_INTERVAL, self.api_key, outputsize=outputsize
         )
         if quota_exceeded:
             logger.warning(f"[RetracementZone] Twelve Data quota exceeded while polling {pair}")
             return
-        if not candles:
+        if not candles_1h:
             logger.warning(f"[RetracementZone] No candle data returned for {pair} — market may be closed")
             return
 
-        if log_boundary:
-            self._log_boundary_alignment(pair, candles)
-
-        latest = candles[-1]  # oldest-first, so the last entry is the most recent
-
-        # Twelve Data may include the still-forming bar as the latest entry. Only treat a
-        # candle as "closed" once its 4H window has fully elapsed.
+        # Twelve Data may include the still-forming bar as the latest entry — only aggregate
+        # 1H candles whose hour has fully elapsed.
         now = datetime.datetime.now(datetime.timezone.utc)
-        if latest["datetime"] + datetime.timedelta(hours=4) > now:
-            if len(candles) < 2:
-                return
-            latest = candles[-2]
+        closed_1h = [c for c in candles_1h if c["datetime"] + datetime.timedelta(hours=1) <= now]
+
+        boundary_hours = _boundary_hours_for(pair)
+        synthetic = _aggregate_1h_to_4h(closed_1h, boundary_hours)
+        if not synthetic:
+            logger.warning(f"[RetracementZone] No complete synthetic 4H bar yet for {pair}")
+            return
+
+        if log_boundary:
+            self._log_boundary_alignment(pair, synthetic)
+
+        latest = synthetic[-1]  # oldest-first, so the last entry is the most recently closed bar
 
         current_state = self._active.get(pair)
         if current_state is not None and current_state.candle_start_utc == latest["datetime"]:
@@ -135,22 +193,18 @@ class RetracementZoneService:
         candle_end = latest["datetime"] + datetime.timedelta(hours=4)
         await self._create_zone_for_candle(pair, latest, candle_end)
 
-    def _log_boundary_alignment(self, pair: str, candles: list[dict]) -> None:
-        timestamps = [c["datetime"] for c in candles]
-        offsets = sorted(
-            {
-                int((dt - dt.replace(hour=0, minute=0, second=0, microsecond=0)).total_seconds() // 60) % 240
-                for dt in timestamps
-            }
-        )
+    def _log_boundary_alignment(self, pair: str, synthetic_candles: list[dict]) -> None:
         logger.info(
-            f"[RetracementZone] {pair} 4H boundary sample (UTC): "
-            + ", ".join(dt.strftime("%Y-%m-%d %H:%M") for dt in timestamps)
+            f"[RetracementZone] {pair} synthetic 4H bars aggregated from 1H data — confirmed "
+            f"FOREX.com boundary, closes at {_boundary_hours_for(pair)} UTC:"
         )
-        logger.info(
-            f"[RetracementZone] {pair} observed minute-of-4h-cycle offset(s): {offsets} "
-            "(a single consistent value confirms the true boundary alignment)"
-        )
+        for candle in synthetic_candles:
+            start_utc = candle["datetime"]
+            end_utc = start_utc + datetime.timedelta(hours=4)
+            logger.info(
+                f"[RetracementZone] {pair}  {start_utc:%Y-%m-%d %H:%M} -> {end_utc:%H:%M} UTC "
+                f"({_to_wat(end_utc):%H:%M} WAT close)"
+            )
 
     # ── Classification + zone calculation ───────────────────────────────────
 

@@ -1,11 +1,10 @@
 # Price Alert Bot
 
-Multi-user Forex price alert bot with lot size calculator, powered by Telegram + Twelve Data.
+Multi-user Forex price alert bot powered by Telegram + Twelve Data.
 
 ## Features
 
 - 🔔 Price alerts (SL, TP, TARGET) per user
-- 📦 Lot size calculator with auto live rate fetching
 - 👤 Per-user Twelve Data API keys — isolated quotas
 - 💾 PostgreSQL persistence — alerts survive restarts
 - 🤖 100% Telegram-native — no web frontend needed
@@ -78,9 +77,10 @@ Tables are created automatically on first run.
 | `/listalerts` | View active alerts |
 | `/cancelalert [ID]` | Cancel by ID |
 | `/cancelalerts [SYMBOL or all]` | Cancel by symbol or all |
-| `/lotsize [PAIR] [RISK$] [SL PIPS]` | Calculate lot size |
 | `/price [PAIR]` | Get live price |
 | `/pairs` | List supported pairs |
+| `/xauzone [PAIR]` | Current 4H retracement-zone status (default XAUUSD) |
+| `/zonealerts [on\|off]` | Opt in/out of 4H zone notifications |
 | `/help` | Full command list |
 
 ### Alert Types
@@ -88,13 +88,14 @@ Tables are created automatically on first run.
 - `TP` — fires when price rises to level
 - `TARGET` — fires when price crosses through the level (real-time tick feed)
 
-### Lot Size Examples
-```
-/lotsize GBPUSD 50 20       → pip value $10 flat (USD quoted)
-/lotsize EURJPY 100 30      → fetches USDJPY live, converts pip value
-/lotsize USDCHF 75 25       → fetches USDCHF live, converts pip value
-/lotsize EURCAD 50 15       → fetches USDCAD live, converts pip value
-```
+### 4H Retracement Zone ("OTE") Alerts
+Requires `TWELVE_DATA_API_KEY` (server-level) in `.env` — disabled otherwise. Tracks each
+configured pair's (default `XAUUSD`) completed 4H candles, classifies bias, and computes the
+midpoint (50%) of that candle's range as the trigger price (direction-independent — same value
+either way). While the next 4H candle forms, live Finnhub ticks are checked against that trigger
+and fire one-shot `ZONE_ENTRY` and `INVALIDATED` alerts (invalidated if price breaks the prior
+candle's opposite extreme first) to opted-in users (`/zonealerts on`). See
+`scripts/inspect_4h_candles.py` to inspect Twelve Data's actual 4H candle boundary alignment.
 
 ---
 
@@ -104,10 +105,10 @@ Tables are created automatically on first run.
 app/
 ├── services/
 │   ├── users_service.py           # User registration + API key storage
-│   ├── market_data_service.py     # Twelve Data price fetching (per-user key)
-│   ├── lot_size_service.py        # Lot size calculation engine
+│   ├── market_data_service.py     # Twelve Data price + candle fetching (per-user key, or server key for zones)
 │   ├── price_alert_service.py     # Alert CRUD + trigger logic
 │   ├── invite_service.py          # Invite-code generation/redemption
+│   ├── retracement_zone_service.py # 4H candle retracement ("OTE") zone tracking + alerts
 │   └── finnhub_price_service.py   # Live Finnhub WebSocket feed
 ├── telegram_bot.py                # All bot commands + message routing
 ├── webhook.py                     # FastAPI app exposing POST /webhook/<token> (production only)
