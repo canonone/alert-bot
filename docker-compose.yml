@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Overrides whatever DB_HOST is in .env — inside the compose network, the Postgres
+      # container is reachable by its service name, not "localhost".
+      DB_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # No "ports:" section — the bot runs in polling mode by default (no inbound HTTP needed).
+    # Only add a ports mapping here if you later switch to webhook mode in production.
+
+volumes:
+  pgdata:
