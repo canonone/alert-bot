@@ -46,11 +46,18 @@ def register_jobs(
         await users_service.reset_all_alert_id_counters()
         logger.info("[DailyCleanup] Alert ID counters reset for all users")
 
+    # Weekly, not daily: runs only on Friday, the last trading day before the weekend.
+    # NOTE: python-telegram-bot's `days` uses 0=Sunday...6=Saturday (NOT Python's usual
+    # Monday=0 convention — this changed in PTB v20.0), so Friday is index 5.
+    # Both jobs MUST share the same cadence — alert IDs are only safe to reset when the
+    # alerts themselves are cleared at the same time, otherwise a still-active alert from
+    # earlier in the week could collide with a new alert reusing the same reset ID.
+    FRIDAY = (5,)
     application.job_queue.run_daily(
-        run_daily_cleanup, time=datetime.time(hour=21, tzinfo=datetime.timezone.utc)
+        run_daily_cleanup, time=datetime.time(hour=21, tzinfo=datetime.timezone.utc), days=FRIDAY
     )
     application.job_queue.run_daily(
-        reset_alert_id_counters, time=datetime.time(hour=23, tzinfo=datetime.timezone.utc)
+        reset_alert_id_counters, time=datetime.time(hour=23, tzinfo=datetime.timezone.utc), days=FRIDAY
     )
 
     if retracement_zone_service is not None:
