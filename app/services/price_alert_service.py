@@ -1,6 +1,7 @@
 import datetime
 import logging
 from dataclasses import dataclass
+from typing import Literal
 
 from sqlalchemy import select, update
 
@@ -27,6 +28,7 @@ ALLOWED_SYMBOLS = {
 class TriggeredAlert:
     alert: PriceAlert
     current_price: float
+    outcome: Literal["SL", "TP", "TARGET", "INVALIDATED"]
 
 
 class PriceAlertService:
@@ -36,7 +38,14 @@ class PriceAlertService:
 
     # ── Add alert ─────────────────────────────────────────────────
 
-    async def add_alert(self, chat_id: str, symbol: str, type_: str, target_price: float) -> tuple[bool, str]:
+    async def add_alert(
+        self,
+        chat_id: str,
+        symbol: str,
+        type_: str,
+        target_price: float,
+        invalidation_price: float | None = None,
+    ) -> tuple[bool, str]:
         upper_symbol = symbol.upper()
 
         if upper_symbol not in ALLOWED_SYMBOLS:
@@ -47,6 +56,12 @@ class PriceAlertService:
 
         if target_price != target_price or target_price <= 0:  # NaN check via self-inequality
             return False, f"❌ Invalid price <b>{target_price}</b>. Enter a valid positive number."
+
+        if invalidation_price is not None and type_ != "TARGET":
+            return False, "❌ An invalidation price is only valid for <b>TARGET</b> alerts."
+
+        if invalidation_price is not None and (invalidation_price != invalidation_price or invalidation_price <= 0):
+            return False, f"❌ Invalid invalidation price <b>{invalidation_price}</b>. Enter a valid positive number."
 
         if type_ in ("SL", "TP"):
             user = await self.users_service.find_by_chat_id(chat_id)
@@ -68,6 +83,22 @@ class PriceAlertService:
                             f"Current price: <b>{current_price}</b>"
                         )
 
+        if type_ == "TARGET" and invalidation_price is not None:
+            user = await self.users_service.find_by_chat_id(chat_id)
+            if user and user.twelve_data_api_key:
+                current_price, _ = await self.market_data.get_current_price(upper_symbol, user.twelve_data_api_key)
+                if current_price is not None:
+                    target_above = target_price > current_price
+                    invalidation_above = invalidation_price > current_price
+                    if target_above == invalidation_above:
+                        return False, (
+                            f"❌ <b>Invalid Invalidation Level</b>\n\n"
+                            f"Target ({target_price}) and invalidation ({invalidation_price}) are on the same "
+                            f"side of the current price ({current_price}).\n\n"
+                            f"They must be on opposite sides of the current price.\n\n"
+                            f"Current price: <b>{current_price}</b>"
+                        )
+
         user_alert_id = await self.users_service.get_next_alert_id(chat_id)
 
         async with SessionLocal() as session:
@@ -76,6 +107,7 @@ class PriceAlertService:
                 symbol=upper_symbol,
                 type=type_,
                 target_price=target_price,
+                invalidation_price=invalidation_price,
                 user_alert_id=user_alert_id,
                 active=True,
             )
@@ -84,12 +116,17 @@ class PriceAlertService:
 
         emoji = self.get_emoji(type_)
 
+        invalidation_line = (
+            f"🛑 Invalidation Price: <b>{invalidation_price}</b>\n" if invalidation_price is not None else ""
+        )
+
         return True, (
             f"{emoji} <b>Alert Set!</b>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 Symbol: <b>{upper_symbol}</b>\n"
             f"📌 Type: <b>{type_}</b>\n"
             f"💰 Target Price: <b>{target_price}</b>\n"
+            f"{invalidation_line}"
             f"🔢 Alert ID: <b>#{user_alert_id}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"You'll be notified when price reaches this level.\n"
@@ -195,7 +232,13 @@ class PriceAlertService:
             message += "━━━━━━━━━━━━━━━━━━━━\n"
             message += f"📊 <b>{symbol}</b>\n"
             for a in symbol_alerts:
-                message += f"  {self.get_emoji(a.type)} {a.type} @ <b>{a.target_price}</b> — #<b>{a.user_alert_id}</b>\n"
+                invalidation_suffix = (
+                    f" (invalidation: <b>{a.invalidation_price}</b>)" if a.invalidation_price is not None else ""
+                )
+                message += (
+                    f"  {self.get_emoji(a.type)} {a.type} @ <b>{a.target_price}</b>{invalidation_suffix} "
+                    f"— #<b>{a.user_alert_id}</b>\n"
+                )
 
         message += "━━━━━━━━━━━━━━━━━━━━\n"
         message += "/cancelalert [id] — cancel by ID\n"
@@ -232,9 +275,10 @@ class PriceAlertService:
             triggered: list[TriggeredAlert] = []
 
             for alert in active:
-                if self.is_triggered(alert, price, previous_price):
+                outcome = self.is_triggered(alert, price, previous_price)
+                if outcome is not None:
                     alert.active = False
-                    triggered.append(TriggeredAlert(alert=alert, current_price=price))
+                    triggered.append(TriggeredAlert(alert=alert, current_price=price, outcome=outcome))
 
             await session.commit()
             return triggered
@@ -287,11 +331,12 @@ class PriceAlertService:
                     logger.warning(f"[{chat_id}] No price for {alert.symbol}")
                     continue
 
-                if self.is_triggered(alert, current_price, None):
+                outcome = self.is_triggered(alert, current_price, None)
+                if outcome is not None:
                     alert.active = False
-                    triggered.append(TriggeredAlert(alert=alert, current_price=current_price))
+                    triggered.append(TriggeredAlert(alert=alert, current_price=current_price, outcome=outcome))
                     logger.info(
-                        f"[{chat_id}] 🔔 #{alert.id} triggered — {alert.symbol} {alert.type} "
+                        f"[{chat_id}] 🔔 #{alert.id} {outcome} — {alert.symbol} {alert.type} "
                         f"@ {alert.target_price} (current: {current_price})"
                     )
 
@@ -300,26 +345,60 @@ class PriceAlertService:
 
     # ── Alert trigger logic ───────────────────────────────────────
 
-    def is_triggered(self, alert: PriceAlert, current_price: float, previous_price: float | None) -> bool:
+    def is_triggered(
+        self, alert: PriceAlert, current_price: float, previous_price: float | None
+    ) -> Literal["SL", "TP", "TARGET", "INVALIDATED"] | None:
         target = float(alert.target_price)
 
         if alert.type == "SL":
-            return current_price <= target
+            return "SL" if current_price <= target else None
         if alert.type == "TP":
-            return current_price >= target
+            return "TP" if current_price >= target else None
         if alert.type == "TARGET":
-            if previous_price is not None:
-                crossed_up = previous_price < target <= current_price
-                crossed_down = previous_price > target >= current_price
-                return crossed_up or crossed_down
-            return current_price == target
-        return False
+            invalidation = alert.invalidation_price
+            if invalidation is not None:
+                # Tie-break: INVALIDATED wins on same-tick ambiguity (matches
+                # RetracementZoneService.check_tick's convention).
+                if self._level_crossed(float(invalidation), current_price, previous_price):
+                    return "INVALIDATED"
+                if self._level_crossed(target, current_price, previous_price):
+                    return "TARGET"
+                return None
+            if self._level_crossed(target, current_price, previous_price):
+                return "TARGET"
+            return None
+        return None
+
+    @staticmethod
+    def _level_crossed(level: float, current_price: float, previous_price: float | None) -> bool:
+        if previous_price is not None:
+            crossed_up = previous_price < level <= current_price
+            crossed_down = previous_price > level >= current_price
+            return crossed_up or crossed_down
+        return current_price == level
 
     # ── Build alert notification message ─────────────────────────
 
-    def build_alert_message(self, alert: PriceAlert, current_price: float) -> str:
+    def build_alert_message(
+        self,
+        alert: PriceAlert,
+        current_price: float,
+        outcome: Literal["SL", "TP", "TARGET", "INVALIDATED"] | None = None,
+    ) -> str:
         wat_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
         formatted_time = wat_time.strftime("%Y-%m-%d %H:%M") + " WAT"
+
+        if outcome == "INVALIDATED":
+            return (
+                f"🚫 <b>TARGET INVALIDATED — {alert.symbol}</b>\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🛑 <b>Invalidation Level:</b> {alert.invalidation_price}\n"
+                f"📍 <b>Target Level:</b> {alert.target_price}\n"
+                f"💰 <b>Current Price:</b> {current_price}\n"
+                f"🕐 <b>Time:</b> {formatted_time}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚠️ Price hit the invalidation level before the target."
+            )
 
         if alert.type == "SL":
             return (

@@ -138,10 +138,10 @@ class FinnhubPriceService:
     async def _check_price_alerts(self, symbol: str, price: float, previous_price: float | None) -> None:
         triggered = await self.price_alert_service.check_tick_against_alerts(symbol, price, previous_price)
         for item in triggered:
-            message = self.price_alert_service.build_alert_message(item.alert, item.current_price)
+            message = self.price_alert_service.build_alert_message(item.alert, item.current_price, item.outcome)
             await self.send_message(item.alert.chat_id, message)
             logger.info(
-                f"[FinnhubPrice] Price alert #{item.alert.user_alert_id} triggered — "
+                f"[FinnhubPrice] Price alert #{item.alert.user_alert_id} {item.outcome} — "
                 f"{symbol} {item.alert.type} @ {item.alert.target_price} for {item.alert.chat_id}"
             )
 

@@ -268,16 +268,19 @@ class TelegramBotService:
             await self._send_setup_prompt(chat_id)
             return
 
-        if len(parts) != 4:
+        if len(parts) not in (4, 5):
             await self.send_message_to_user(
                 chat_id,
                 "❌ <b>Invalid format</b>\n\n"
-                "Usage: <code>/setalert [PAIR] [TYPE] [PRICE]</code>\n\n"
+                "Usage: <code>/setalert [PAIR] [TYPE] [PRICE]</code>\n"
+                "For TARGET, an optional invalidation price:\n"
+                "<code>/setalert [PAIR] TARGET [PRICE] [INVALIDATION_PRICE]</code>\n\n"
                 "Types: <b>SL</b> | <b>TP</b> | <b>TARGET</b>\n\n"
                 "Examples:\n"
                 "<code>/setalert GBPUSD SL 1.3200</code>\n"
                 "<code>/setalert EURUSD TP 1.1500</code>\n"
-                "<code>/setalert XAUUSD TARGET 3300.00</code>",
+                "<code>/setalert XAUUSD TARGET 3300.00</code>\n"
+                "<code>/setalert XAUUSD TARGET 3300.00 3250.00</code>",
             )
             return
 
@@ -294,7 +297,24 @@ class TelegramBotService:
             )
             return
 
-        success, message = await self.price_alert_service.add_alert(chat_id, symbol, type_, price)
+        if len(parts) == 5 and type_ != "TARGET":
+            await self.send_message_to_user(
+                chat_id,
+                "❌ An invalidation price is only valid for <b>TARGET</b> alerts.\n\n"
+                "Usage: <code>/setalert [PAIR] [TYPE] [PRICE]</code>",
+            )
+            return
+
+        invalidation_price: float | None = None
+        if len(parts) == 5:
+            try:
+                invalidation_price = float(parts[4])
+            except ValueError:
+                invalidation_price = float("nan")
+
+        success, message = await self.price_alert_service.add_alert(
+            chat_id, symbol, type_, price, invalidation_price
+        )
         await self.send_message_to_user(chat_id, message)
 
         if success and self.finnhub_price_service is not None:
@@ -411,6 +431,7 @@ class TelegramBotService:
             "━━━━━━━━━━━━━━━━━━━━\n"
             "<b>🔔 Alerts</b>\n\n"
             "<code>/setalert [PAIR] [TYPE] [PRICE]</code>\n"
+            "<code>/setalert [PAIR] TARGET [PRICE] [INVALIDATION]</code>\n"
             "<code>/listalerts</code>\n"
             "<code>/cancelalert [ID]</code>\n"
             "<code>/cancelalerts [SYMBOL or all]</code>\n\n"
