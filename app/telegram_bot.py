@@ -93,7 +93,7 @@ class TelegramBotService:
         elif command == "/resetkey":
             await self._handle_resetkey(chat_id)
         elif command == "/setalert":
-            await self._handle_setalert(chat_id, parts)
+            await self._handle_setalert(chat_id, text)
         elif command == "/listalerts":
             await self._handle_listalerts(chat_id)
         elif command == "/cancelalert":
@@ -262,11 +262,15 @@ class TelegramBotService:
 
     # ── /setalert ─────────────────────────────────────────────────
 
-    async def _handle_setalert(self, chat_id: str, parts: list[str]) -> None:
+    async def _handle_setalert(self, chat_id: str, text: str) -> None:
         user = await self.users_service.find_by_chat_id(chat_id)
         if not user or not user.is_setup:
             await self._send_setup_prompt(chat_id)
             return
+
+        command_part, _, note_part = text.partition("|")
+        note = note_part.strip() or None
+        parts = [p for p in command_part.split(" ") if p]
 
         if len(parts) not in (4, 5):
             await self.send_message_to_user(
@@ -275,12 +279,15 @@ class TelegramBotService:
                 "Usage: <code>/setalert [PAIR] [TYPE] [PRICE]</code>\n"
                 "For TARGET, an optional invalidation price:\n"
                 "<code>/setalert [PAIR] TARGET [PRICE] [INVALIDATION_PRICE]</code>\n\n"
+                "Add an optional note with <code>|</code>:\n"
+                "<code>/setalert [PAIR] [TYPE] [PRICE] | [NOTE]</code>\n\n"
                 "Types: <b>SL</b> | <b>TP</b> | <b>TARGET</b>\n\n"
                 "Examples:\n"
                 "<code>/setalert GBPUSD SL 1.3200</code>\n"
                 "<code>/setalert EURUSD TP 1.1500</code>\n"
                 "<code>/setalert XAUUSD TARGET 3300.00</code>\n"
-                "<code>/setalert XAUUSD TARGET 3300.00 3250.00</code>",
+                "<code>/setalert XAUUSD TARGET 3300.00 3250.00</code>\n"
+                "<code>/setalert EURUSD SL 1.0800 | protect the long</code>",
             )
             return
 
@@ -313,7 +320,7 @@ class TelegramBotService:
                 invalidation_price = float("nan")
 
         success, message = await self.price_alert_service.add_alert(
-            chat_id, symbol, type_, price, invalidation_price
+            chat_id, symbol, type_, price, invalidation_price, note
         )
         await self.send_message_to_user(chat_id, message)
 

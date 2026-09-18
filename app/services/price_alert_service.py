@@ -1,4 +1,5 @@
 import datetime
+import html
 import logging
 from dataclasses import dataclass
 from typing import Literal
@@ -45,8 +46,10 @@ class PriceAlertService:
         type_: str,
         target_price: float,
         invalidation_price: float | None = None,
+        note: str | None = None,
     ) -> tuple[bool, str]:
         upper_symbol = symbol.upper()
+        note = note.strip()[:200] if note and note.strip() else None
 
         if upper_symbol not in ALLOWED_SYMBOLS:
             return False, (
@@ -108,6 +111,7 @@ class PriceAlertService:
                 type=type_,
                 target_price=target_price,
                 invalidation_price=invalidation_price,
+                note=note,
                 user_alert_id=user_alert_id,
                 active=True,
             )
@@ -119,6 +123,7 @@ class PriceAlertService:
         invalidation_line = (
             f"🛑 Invalidation Price: <b>{invalidation_price}</b>\n" if invalidation_price is not None else ""
         )
+        note_line = f"📝 Note: <b>{html.escape(note)}</b>\n" if note is not None else ""
 
         return True, (
             f"{emoji} <b>Alert Set!</b>\n\n"
@@ -127,6 +132,7 @@ class PriceAlertService:
             f"📌 Type: <b>{type_}</b>\n"
             f"💰 Target Price: <b>{target_price}</b>\n"
             f"{invalidation_line}"
+            f"{note_line}"
             f"🔢 Alert ID: <b>#{user_alert_id}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"You'll be notified when price reaches this level.\n"
@@ -235,9 +241,10 @@ class PriceAlertService:
                 invalidation_suffix = (
                     f" (invalidation: <b>{a.invalidation_price}</b>)" if a.invalidation_price is not None else ""
                 )
+                note_suffix = f" 📝 <i>{html.escape(a.note)}</i>" if a.note is not None else ""
                 message += (
                     f"  {self.get_emoji(a.type)} {a.type} @ <b>{a.target_price}</b>{invalidation_suffix} "
-                    f"— #<b>{a.user_alert_id}</b>\n"
+                    f"— #<b>{a.user_alert_id}</b>{note_suffix}\n"
                 )
 
         message += "━━━━━━━━━━━━━━━━━━━━\n"
@@ -387,6 +394,7 @@ class PriceAlertService:
     ) -> str:
         wat_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
         formatted_time = wat_time.strftime("%Y-%m-%d %H:%M") + " WAT"
+        note_line = f"📝 <b>Note:</b> {html.escape(alert.note)}\n" if alert.note is not None else ""
 
         if outcome == "INVALIDATED":
             return (
@@ -396,6 +404,7 @@ class PriceAlertService:
                 f"📍 <b>Target Level:</b> {alert.target_price}\n"
                 f"💰 <b>Current Price:</b> {current_price}\n"
                 f"🕐 <b>Time:</b> {formatted_time}\n"
+                f"{note_line}"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"⚠️ Price hit the invalidation level before the target."
             )
@@ -407,6 +416,7 @@ class PriceAlertService:
                 f"💀 <b>SL Level:</b> {alert.target_price}\n"
                 f"📉 <b>Current Price:</b> {current_price}\n"
                 f"🕐 <b>Time:</b> {formatted_time}\n"
+                f"{note_line}"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"⚠️ Cut your losses. Protect your capital."
             )
@@ -417,6 +427,7 @@ class PriceAlertService:
                 f"🎯 <b>TP Level:</b> {alert.target_price}\n"
                 f"📈 <b>Current Price:</b> {current_price}\n"
                 f"🕐 <b>Time:</b> {formatted_time}\n"
+                f"{note_line}"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"💰 Well done. Lock in those gains."
             )
@@ -427,6 +438,7 @@ class PriceAlertService:
             f"📍 <b>Target:</b> {alert.target_price}\n"
             f"💰 <b>Current Price:</b> {current_price}\n"
             f"🕐 <b>Time:</b> {formatted_time}\n"
+            f"{note_line}"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 Your target level has been reached."
         )

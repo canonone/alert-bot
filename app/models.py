@@ -65,6 +65,8 @@ class PriceAlert(Base):
     target_price: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
     # TARGET-only, optional: race second level — see PriceAlertService.is_triggered
     invalidation_price: Mapped[float | None] = mapped_column(Numeric(18, 6, asdecimal=False), nullable=True)
+    # Optional free-text note, any alert type — shown in the trigger notification
+    note: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
     user_alert_id: Mapped[int] = mapped_column(Integer, default=0)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
