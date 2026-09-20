@@ -30,6 +30,28 @@ ONE_H_INTERVAL = "1h"
 ONE_H_BOUNDARY_SAMPLE_SIZE = 24  # ~1 day of 1H candles, logged once on bootstrap for verification
 ONE_H_POLL_LOOKBACK = 10  # comfortably covers the last 2 full synthetic 4H buckets on every poll
 
+# Forex/gold markets close for the weekend and reopen on a fixed weekly schedule. Roughly
+# Friday 21:00 UTC through Sunday 21:00 UTC. During this window Twelve Data keeps returning
+# "complete" 1H candles for a closed market — same last-traded price repeated with tiny float
+# jitter — which would otherwise look like a genuine new 4H bar every boundary. Weekday numbers
+# follow datetime.weekday(): Monday=0 ... Sunday=6.
+MARKET_CLOSE_WEEKDAY_UTC = 4  # Friday
+MARKET_CLOSE_HOUR_UTC = 21
+MARKET_REOPEN_WEEKDAY_UTC = 6  # Sunday
+MARKET_REOPEN_HOUR_UTC = 21
+
+# Backstop for cases the calendar window above doesn't anticipate (holidays, unexpected feed
+# gaps, a broker closing/reopening slightly off our assumed schedule): if a synthetic 4H
+# candle's range is suspiciously small, the feed is almost certainly repeating a frozen
+# last-traded price rather than reporting a real session. Thresholds sit well below a normal
+# quiet-hour range for the asset, but comfortably above the sub-pip/sub-cent jitter a frozen
+# closed-market feed produces. Per-pair since typical range varies wildly by asset class.
+DEFAULT_DEGENERATE_RANGE_THRESHOLD = 0.0005  # ~5 pips — most FX pairs
+PAIR_DEGENERATE_RANGE_THRESHOLD: dict[str, float] = {
+    "XAUUSD": 0.05,  # gold: real 4H ranges typically span several dollars; a nickel is far
+    # below even the quietest genuine session
+}
+
 
 def _to_wat(dt: datetime.datetime) -> datetime.datetime:
     # Matches the WAT formatting convention in price_alert_service.build_alert_message
@@ -38,6 +60,24 @@ def _to_wat(dt: datetime.datetime) -> datetime.datetime:
 
 def _boundary_hours_for(pair: str) -> list[int]:
     return PAIR_FOUR_H_BOUNDARY_HOURS_UTC.get(pair, DEFAULT_FOUR_H_BOUNDARY_HOURS_UTC)
+
+
+def _degenerate_range_threshold_for(pair: str) -> float:
+    return PAIR_DEGENERATE_RANGE_THRESHOLD.get(pair, DEFAULT_DEGENERATE_RANGE_THRESHOLD)
+
+
+def _is_market_closed(close_time_utc: datetime.datetime) -> bool:
+    """True if `close_time_utc` (a candle's close timestamp, UTC) falls within the weekly
+    broker-closed window: Friday MARKET_CLOSE_HOUR_UTC through Sunday MARKET_REOPEN_HOUR_UTC.
+
+    Represented as minutes since the start of the week (Monday 00:00 UTC) so the comparison
+    is a single range check — the window doesn't wrap past the week boundary since Friday
+    comes before Sunday.
+    """
+    minute_of_week = close_time_utc.weekday() * 24 * 60 + close_time_utc.hour * 60 + close_time_utc.minute
+    close_start = MARKET_CLOSE_WEEKDAY_UTC * 24 * 60 + MARKET_CLOSE_HOUR_UTC * 60
+    reopen_start = MARKET_REOPEN_WEEKDAY_UTC * 24 * 60 + MARKET_REOPEN_HOUR_UTC * 60
+    return close_start <= minute_of_week < reopen_start
 
 
 def _bucket_start(dt: datetime.datetime, boundary_hours: list[int]) -> datetime.datetime:
@@ -125,6 +165,10 @@ class RetracementZoneService:
         # avoids a DB round trip on every single price tick.
         self._active: dict[str, ZoneState] = {}
 
+        # Pairs for which we've already logged "entering market-closed window" — cleared on
+        # reopen so the message logs once per closed period, not on every 5-minute poll.
+        self._market_closed_logged: set[str] = set()
+
     # ── Startup: resume from DB, or seed from the latest closed candle ─────
 
     async def bootstrap(self) -> None:
@@ -185,12 +229,23 @@ class RetracementZoneService:
             self._log_boundary_alignment(pair, synthetic)
 
         latest = synthetic[-1]  # oldest-first, so the last entry is the most recently closed bar
+        candle_end = latest["datetime"] + datetime.timedelta(hours=4)
+
+        if _is_market_closed(candle_end):
+            if pair not in self._market_closed_logged:
+                logger.info(
+                    f"[RetracementZone] {pair} entering market-closed window (candle closing "
+                    f"{_to_wat(candle_end):%Y-%m-%d %H:%M} WAT) — suppressing zone creation "
+                    "until the market reopens"
+                )
+                self._market_closed_logged.add(pair)
+            return  # leave whatever zone is already tracked untouched — no notification
+        self._market_closed_logged.discard(pair)
 
         current_state = self._active.get(pair)
         if current_state is not None and current_state.candle_start_utc == latest["datetime"]:
-            return  # already tracking this candle — no new close yet (e.g. weekend market closure)
+            return  # already tracking this candle — no new close yet
 
-        candle_end = latest["datetime"] + datetime.timedelta(hours=4)
         await self._create_zone_for_candle(pair, latest, candle_end)
 
     def _log_boundary_alignment(self, pair: str, synthetic_candles: list[dict]) -> None:
@@ -213,6 +268,16 @@ class RetracementZoneService:
     ) -> None:
         o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
         candle_range = h - l
+
+        threshold = _degenerate_range_threshold_for(pair)
+        if candle_range < threshold:
+            wat_start = _to_wat(candle["datetime"])
+            logger.info(
+                f"[RetracementZone] {pair} candle at {wat_start:%Y-%m-%d %H:%M} WAT has a "
+                f"degenerate range ({candle_range:.5f} < {threshold} threshold) — treating as "
+                "stale/frozen data (market closed?) and skipping zone creation"
+            )
+            return  # leave whatever zone is already tracked untouched — no notification
 
         bias = "bullish" if c > o else ("bearish" if c < o else "neutral")
         is_neutral = bias == "neutral"
