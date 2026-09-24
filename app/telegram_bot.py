@@ -1,3 +1,4 @@
+import html
 import logging
 from typing import Any
 
@@ -10,6 +11,17 @@ from app.services.price_alert_service import PriceAlertService
 from app.services.users_service import UsersService
 
 logger = logging.getLogger("TelegramBotService")
+
+# /setalert SL|TP direction token → stored direction
+DIRECTION_ALIASES = {"LONG": "LONG", "BUY": "LONG", "SHORT": "SHORT", "SELL": "SHORT"}
+
+
+def _is_number(token: str) -> bool:
+    try:
+        float(token)
+        return True
+    except ValueError:
+        return False
 
 
 class TelegramBotService:
@@ -278,13 +290,16 @@ class TelegramBotService:
                 "❌ <b>Invalid format</b>\n\n"
                 "Usage: <code>/setalert [PAIR] [TYPE] [PRICE]</code>\n"
                 "For TARGET, an optional invalidation price:\n"
-                "<code>/setalert [PAIR] TARGET [PRICE] [INVALIDATION_PRICE]</code>\n\n"
+                "<code>/setalert [PAIR] TARGET [PRICE] [INVALIDATION_PRICE]</code>\n"
+                "For SL/TP, an optional direction (default LONG):\n"
+                "<code>/setalert [PAIR] SL|TP [PRICE] [LONG|SHORT]</code>\n\n"
                 "Add an optional note with <code>|</code>:\n"
                 "<code>/setalert [PAIR] [TYPE] [PRICE] | [NOTE]</code>\n\n"
                 "Types: <b>SL</b> | <b>TP</b> | <b>TARGET</b>\n\n"
                 "Examples:\n"
                 "<code>/setalert GBPUSD SL 1.3200</code>\n"
                 "<code>/setalert EURUSD TP 1.1500</code>\n"
+                "<code>/setalert USDCAD SL 1.4130 SHORT</code>\n"
                 "<code>/setalert XAUUSD TARGET 3300.00</code>\n"
                 "<code>/setalert XAUUSD TARGET 3300.00 3250.00</code>\n"
                 "<code>/setalert EURUSD SL 1.0800 | protect the long</code>",
@@ -304,23 +319,36 @@ class TelegramBotService:
             )
             return
 
+        # 5th token: SL/TP → direction; TARGET → invalidation price (unchanged)
+        direction = "LONG"
         if len(parts) == 5 and type_ != "TARGET":
-            await self.send_message_to_user(
-                chat_id,
-                "❌ An invalidation price is only valid for <b>TARGET</b> alerts.\n\n"
-                "Usage: <code>/setalert [PAIR] [TYPE] [PRICE]</code>",
-            )
-            return
+            direction_token = parts[4].upper()
+            if _is_number(parts[4]):
+                await self.send_message_to_user(
+                    chat_id,
+                    "❌ An invalidation price is only valid for <b>TARGET</b> alerts.\n\n"
+                    "Usage: <code>/setalert [PAIR] [TYPE] [PRICE]</code>",
+                )
+                return
+            if direction_token not in DIRECTION_ALIASES:
+                await self.send_message_to_user(
+                    chat_id,
+                    f"❌ Invalid direction <b>{html.escape(parts[4])}</b>\n\n"
+                    "Valid directions: <b>LONG</b> (or BUY) | <b>SHORT</b> (or SELL)\n\n"
+                    "Usage: <code>/setalert [PAIR] SL|TP [PRICE] [LONG|SHORT]</code>",
+                )
+                return
+            direction = DIRECTION_ALIASES[direction_token]
 
         invalidation_price: float | None = None
-        if len(parts) == 5:
+        if len(parts) == 5 and type_ == "TARGET":
             try:
                 invalidation_price = float(parts[4])
             except ValueError:
                 invalidation_price = float("nan")
 
         success, message = await self.price_alert_service.add_alert(
-            chat_id, symbol, type_, price, invalidation_price, note
+            chat_id, symbol, type_, price, invalidation_price, note, direction
         )
         await self.send_message_to_user(chat_id, message)
 
@@ -438,6 +466,7 @@ class TelegramBotService:
             "━━━━━━━━━━━━━━━━━━━━\n"
             "<b>🔔 Alerts</b>\n\n"
             "<code>/setalert [PAIR] [TYPE] [PRICE]</code>\n"
+            "<code>/setalert [PAIR] SL|TP [PRICE] [LONG|SHORT]</code>\n"
             "<code>/setalert [PAIR] TARGET [PRICE] [INVALIDATION]</code>\n"
             "<code>/listalerts</code>\n"
             "<code>/cancelalert [ID]</code>\n"

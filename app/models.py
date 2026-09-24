@@ -15,6 +15,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db import Base
 
 AlertType = str  # one of "SL", "TP", "TARGET"
+Direction = str  # one of "LONG", "SHORT"
 
 
 class User(Base):
@@ -67,6 +68,9 @@ class PriceAlert(Base):
     invalidation_price: Mapped[float | None] = mapped_column(Numeric(18, 6, asdecimal=False), nullable=True)
     # Optional free-text note, any alert type — shown in the trigger notification
     note: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # SL/TP only: which side of the trade the level protects — see PriceAlertService.is_triggered.
+    # TARGET rows keep the "LONG" default and ignore it.
+    direction: Mapped[str] = mapped_column(String(10), nullable=False, default="LONG", server_default="LONG")
 
     user_alert_id: Mapped[int] = mapped_column(Integer, default=0)
     active: Mapped[bool] = mapped_column(Boolean, default=True)

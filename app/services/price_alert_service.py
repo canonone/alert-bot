@@ -47,9 +47,13 @@ class PriceAlertService:
         target_price: float,
         invalidation_price: float | None = None,
         note: str | None = None,
+        direction: str = "LONG",
     ) -> tuple[bool, str]:
         upper_symbol = symbol.upper()
         note = note.strip()[:200] if note and note.strip() else None
+        direction = direction.upper()
+        # Only mention direction in rejections for SHORT, so LONG messages stay exactly as before
+        direction_suffix = " for a <b>SHORT</b> position" if direction == "SHORT" else ""
 
         if upper_symbol not in ALLOWED_SYMBOLS:
             return False, (
@@ -66,23 +70,31 @@ class PriceAlertService:
         if invalidation_price is not None and (invalidation_price != invalidation_price or invalidation_price <= 0):
             return False, f"❌ Invalid invalidation price <b>{invalidation_price}</b>. Enter a valid positive number."
 
+        if direction not in ("LONG", "SHORT"):
+            return False, f"❌ Invalid direction <b>{html.escape(direction)}</b>. Use <b>LONG</b> or <b>SHORT</b>."
+
+        if direction == "SHORT" and type_ not in ("SL", "TP"):
+            return False, "❌ A direction is only valid for <b>SL</b> and <b>TP</b> alerts."
+
         if type_ in ("SL", "TP"):
             user = await self.users_service.find_by_chat_id(chat_id)
             if user and user.twelve_data_api_key:
                 current_price, _ = await self.market_data.get_current_price(upper_symbol, user.twelve_data_api_key)
                 if current_price is not None:
-                    if type_ == "SL" and current_price <= target_price:
+                    # LONG SL / SHORT TP sit below price; LONG TP / SHORT SL sit above it.
+                    must_be_below = (type_ == "SL") == (direction == "LONG")
+                    if must_be_below and current_price <= target_price:
                         return False, (
-                            f"❌ <b>Invalid SL Level</b>\n\n"
-                            f"Your SL ({target_price}) is at or above the current price ({current_price}).\n\n"
-                            f"SL must be set BELOW current price.\n\n"
+                            f"❌ <b>Invalid {type_} Level</b>\n\n"
+                            f"Your {type_} ({target_price}) is at or above the current price ({current_price}).\n\n"
+                            f"{type_} must be set BELOW current price{direction_suffix}.\n\n"
                             f"Current price: <b>{current_price}</b>"
                         )
-                    if type_ == "TP" and current_price >= target_price:
+                    if not must_be_below and current_price >= target_price:
                         return False, (
-                            f"❌ <b>Invalid TP Level</b>\n\n"
-                            f"Your TP ({target_price}) is at or below the current price ({current_price}).\n\n"
-                            f"TP must be set ABOVE current price.\n\n"
+                            f"❌ <b>Invalid {type_} Level</b>\n\n"
+                            f"Your {type_} ({target_price}) is at or below the current price ({current_price}).\n\n"
+                            f"{type_} must be set ABOVE current price{direction_suffix}.\n\n"
                             f"Current price: <b>{current_price}</b>"
                         )
 
@@ -112,6 +124,7 @@ class PriceAlertService:
                 target_price=target_price,
                 invalidation_price=invalidation_price,
                 note=note,
+                direction=direction,
                 user_alert_id=user_alert_id,
                 active=True,
             )
@@ -124,12 +137,14 @@ class PriceAlertService:
             f"🛑 Invalidation Price: <b>{invalidation_price}</b>\n" if invalidation_price is not None else ""
         )
         note_line = f"📝 Note: <b>{html.escape(note)}</b>\n" if note is not None else ""
+        direction_line = f"🧭 Direction: <b>{direction}</b>\n" if type_ in ("SL", "TP") else ""
 
         return True, (
             f"{emoji} <b>Alert Set!</b>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 Symbol: <b>{upper_symbol}</b>\n"
             f"📌 Type: <b>{type_}</b>\n"
+            f"{direction_line}"
             f"💰 Target Price: <b>{target_price}</b>\n"
             f"{invalidation_line}"
             f"{note_line}"
@@ -242,8 +257,9 @@ class PriceAlertService:
                     f" (invalidation: <b>{a.invalidation_price}</b>)" if a.invalidation_price is not None else ""
                 )
                 note_suffix = f" 📝 <i>{html.escape(a.note)}</i>" if a.note is not None else ""
+                direction_label = f" ({a.direction})" if a.type in ("SL", "TP") else ""
                 message += (
-                    f"  {self.get_emoji(a.type)} {a.type} @ <b>{a.target_price}</b>{invalidation_suffix} "
+                    f"  {self.get_emoji(a.type)} {a.type}{direction_label} @ <b>{a.target_price}</b>{invalidation_suffix} "
                     f"— #<b>{a.user_alert_id}</b>{note_suffix}\n"
                 )
 
@@ -357,10 +373,14 @@ class PriceAlertService:
     ) -> Literal["SL", "TP", "TARGET", "INVALIDATED"] | None:
         target = float(alert.target_price)
 
+        # LONG: SL below / TP above. SHORT mirrors it: SL above / TP below.
+        is_short = alert.direction == "SHORT"
         if alert.type == "SL":
-            return "SL" if current_price <= target else None
+            hit = current_price >= target if is_short else current_price <= target
+            return "SL" if hit else None
         if alert.type == "TP":
-            return "TP" if current_price >= target else None
+            hit = current_price <= target if is_short else current_price >= target
+            return "TP" if hit else None
         if alert.type == "TARGET":
             invalidation = alert.invalidation_price
             if invalidation is not None:
@@ -409,12 +429,14 @@ class PriceAlertService:
                 f"⚠️ Price hit the invalidation level before the target."
             )
 
+        is_short = alert.direction == "SHORT"
+
         if alert.type == "SL":
             return (
-                f"🔴 <b>STOP LOSS HIT — {alert.symbol}</b>\n\n"
+                f"🔴 <b>STOP LOSS HIT ({alert.direction} position) — {alert.symbol}</b>\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"💀 <b>SL Level:</b> {alert.target_price}\n"
-                f"📉 <b>Current Price:</b> {current_price}\n"
+                f"{'📈' if is_short else '📉'} <b>Current Price:</b> {current_price}\n"
                 f"🕐 <b>Time:</b> {formatted_time}\n"
                 f"{note_line}"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -422,10 +444,10 @@ class PriceAlertService:
             )
         if alert.type == "TP":
             return (
-                f"🟢 <b>TAKE PROFIT HIT — {alert.symbol}</b>\n\n"
+                f"🟢 <b>TAKE PROFIT HIT ({alert.direction} position) — {alert.symbol}</b>\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 <b>TP Level:</b> {alert.target_price}\n"
-                f"📈 <b>Current Price:</b> {current_price}\n"
+                f"{'📉' if is_short else '📈'} <b>Current Price:</b> {current_price}\n"
                 f"🕐 <b>Time:</b> {formatted_time}\n"
                 f"{note_line}"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
