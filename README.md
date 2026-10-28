@@ -95,7 +95,8 @@ Tables are created automatically on first run.
 Requires `TWELVE_DATA_API_KEY` (server-level) in `.env` — disabled otherwise. Opt in with
 `/sweepalerts on` (approved users only).
 
-**Pattern** (daily timeframe, all comparisons strict, evaluated only after Day 2 has fully closed):
+**Pattern** (daily timeframe, evaluated only after Day 2 has fully closed; the margins below apply on top of
+these comparisons — see *Margins and settings*):
 
 - **SELL** — Day 1 closes bullish, Day 2 closes bearish, Day 2's high > Day 1's high (sweep) and
   Day 2's low > Day 1's low (no low sweep). Level = Day 2's open. During Day 3, alert when price
@@ -129,6 +130,22 @@ between Day 1 and Day 2 can no longer occur and the "no gap" skip effectively ne
 Day 1 closed exactly on its own high/low, or when an open fell back to the first bar). The code is
 kept as a harmless guard. `/sweepcheck` shows `open = previous close` per candle, and both values
 when the first 1H bar's open differs by more than 2 pips.
+
+### Margins and settings
+Small feed differences between Twelve Data and FOREX.com shouldn't create or break a setup, so the
+patterns carry minimum margins. A pip is 0.0001 (0.01 for JPY pairs, 0.1 for XAUUSD). Each setting is
+a default constant in `app/services/daily_sweep_service.py` with a per-pair override dict:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `MIN_BEYOND_PIPS` (`PAIR_MIN_BEYOND_PIPS`) | 3 | A continuation's Day 2 **close** must be at least this far beyond Day 1's high (BUY) / low (SELL); a sweep's Day 2 **wick** must go at least this far beyond Day 1's high (SELL) / low (BUY). The "didn't take the opposite side" checks stay strict. |
+| `MIN_BODY_PIPS` (`PAIR_MIN_BODY_PIPS`) | 2 | A day is only bullish/bearish if `|close − open|` is at least this. Anything smaller is a doji and matches neither pattern. |
+| `MERGE_LEVELS_PIPS` (`PAIR_MERGE_LEVELS_PIPS`) | 3 | When a continuation's Level 1 and Level 2 are within this many pips, they are one zone: ONE combined alert when Level 1 is reached (with a note that the levels are only X pips apart), and the setup is complete. `/sweepcheck`, `/sweeps` and the digest show "single alert (levels X pips apart)". |
+
+`/sweepcheck` lists every failed check with the numbers, e.g.
+`✗ needs Day 2 to close ≥3 pips above Day 1's high — but it closed 0.1 pips above (112.408 vs 112.407)`
+and `✗ Day 2 is a doji (body 1.1 pips < 2)`. Whether levels are merged is decided from the stored
+levels and the current setting, so changing `MERGE_LEVELS_PIPS` also applies to setups already armed.
 
 **Daily candles.** A trading day runs 17:00 → 17:00 `America/New_York` (matching FOREX.com on
 TradingView), built by aggregating Twelve Data 1H bars — Twelve Data's own `1day` candles use

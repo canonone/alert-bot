@@ -114,6 +114,34 @@ def pip_size(pair: str) -> float:
 # How far the first 1H bar's open may sit from the previous close before /sweepcheck shows both
 OPEN_DIFF_NOTE_PIPS = 2
 
+# Pattern margins, so small feed differences between Twelve Data and FOREX.com can't create or break
+# a setup. All in pips (0.0001; 0.01 for JPY pairs; 0.1 for XAUUSD — see pip_size); each has a
+# per-pair override dict.
+# - A break must go beyond Day 1's extreme by at least this: the continuation's CLOSE, the sweep's WICK.
+#   ("Did not take the opposite side" checks stay strict, no margin.)
+MIN_BEYOND_PIPS = 3.0
+PAIR_MIN_BEYOND_PIPS: dict[str, float] = {}
+# - A day is only bullish/bearish if |close - open| is at least this; smaller is a doji and matches neither.
+MIN_BODY_PIPS = 2.0
+PAIR_MIN_BODY_PIPS: dict[str, float] = {}
+# - Continuation levels this close together (Level 1 vs Level 2) are one zone: one alert, not two.
+MERGE_LEVELS_PIPS = 3.0
+PAIR_MERGE_LEVELS_PIPS: dict[str, float] = {}
+
+_PIP_EPS = 1e-6  # float slack when comparing pip distances to a threshold
+
+
+def min_beyond_pips_for(pair: str) -> float:
+    return PAIR_MIN_BEYOND_PIPS.get(pair, MIN_BEYOND_PIPS)
+
+
+def min_body_pips_for(pair: str) -> float:
+    return PAIR_MIN_BODY_PIPS.get(pair, MIN_BODY_PIPS)
+
+
+def merge_levels_pips_for(pair: str) -> float:
+    return PAIR_MERGE_LEVELS_PIPS.get(pair, MERGE_LEVELS_PIPS)
+
 
 def min_daily_bars_for(pair: str) -> int:
     return PAIR_MIN_DAILY_BARS.get(pair, DEFAULT_MIN_DAILY_BARS)
@@ -342,14 +370,15 @@ class ContinuationSignal:
 
 
 class Check(NamedTuple):
-    """One strict condition: what the pattern needs, whether it held, and what actually happened."""
+    """One condition: what the pattern needs, whether it held, and what actually happened."""
 
     needs: str
     ok: bool
     but: str  # the actual numbers, e.g. "Day 2 high 1.96841 < Day 1 high 1.97157"
+    text: str | None = None  # a fully custom failure line (used for dojis)
 
     def failure_text(self) -> str:
-        return f"✗ needs {self.needs} — but {self.but}"
+        return self.text or f"✗ needs {self.needs} — but {self.but}"
 
 
 def _compare(pair: str, a_label: str, a: float, b_label: str, b: float) -> str:
@@ -358,35 +387,79 @@ def _compare(pair: str, a_label: str, a: float, b_label: str, b: float) -> str:
     return f"{a_label} {format_price(pair, a)} {relation} {b_label} {format_price(pair, b)}"
 
 
-def sweep_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pair: str = "") -> list[Check]:
-    """Every strict condition for `direction` — used by detect_sweep, the scan log and /sweepcheck."""
-    def close_vs_open(day: str, c: DailyCandle) -> str:
-        return _compare(pair, f"{day} close", c.close, "open", c.open)
+def body_pips(candle: DailyCandle, pair: str) -> float:
+    """Signed body: positive for a bullish close, negative for a bearish one."""
+    return (candle.close - candle.open) / pip_size(pair)
 
+
+def is_bullish(candle: DailyCandle, pair: str = "") -> bool:
+    return body_pips(candle, pair) >= min_body_pips_for(pair) - _PIP_EPS
+
+
+def is_bearish(candle: DailyCandle, pair: str = "") -> bool:
+    return -body_pips(candle, pair) >= min_body_pips_for(pair) - _PIP_EPS
+
+
+def _colour_check(label: str, candle: DailyCandle, want_bullish: bool, pair: str) -> Check:
+    needs = f"{label} to close {'bullish' if want_bullish else 'bearish'}"
+    if (is_bullish if want_bullish else is_bearish)(candle, pair):
+        return Check(needs, True, "")
+    minimum = min_body_pips_for(pair)
+    body = abs(body_pips(candle, pair))
+    if body < minimum - _PIP_EPS:
+        return Check(needs, False, "", f"✗ {label} is a doji (body {body:.1f} pips < {minimum:g})")
+    return Check(needs, False, _compare(pair, f"{label} close", candle.close, "open", candle.open))
+
+
+def _move_text(pair: str, delta: float, positive: str, negative: str, level: str, a: float, b: float) -> str:
+    """"But" text for a margin check, e.g. "it closed 0.1 pips above (112.408 vs 112.407)".
+    `delta` is signed pips in the direction the pattern needs; the templates take {n}, the size."""
+    figures = f"({format_price(pair, a)} vs {format_price(pair, b)})"
+    if abs(delta) < _PIP_EPS:
+        return f"{level} {figures}"
+    return f"{(positive if delta > 0 else negative).format(n=abs(delta))} {figures}"
+
+
+def _margin_check(needs: str, delta: float, minimum: float, but: str) -> Check:
+    return Check(needs, delta >= minimum - _PIP_EPS, but)
+
+
+def sweep_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pair: str = "") -> list[Check]:
+    """Every condition for `direction` — used by detect_sweep, the scan log and /sweepcheck. The sweep
+    itself needs the wick to go MIN_BEYOND_PIPS past Day 1's extreme; "stay above/below" is strict."""
+    pip, margin = pip_size(pair), min_beyond_pips_for(pair)
     if direction == SELL:
+        delta = (day2.high - day1.high) / pip
         return [
-            Check("Day 1 to close bullish", day1.close > day1.open, close_vs_open("Day 1", day1)),
-            Check("Day 2 to close bearish", day2.close < day2.open, close_vs_open("Day 2", day2)),
-            Check("Day 2 to sweep Day 1's high", day2.high > day1.high,
-                  _compare(pair, "Day 2 high", day2.high, "Day 1 high", day1.high)),
+            _colour_check("Day 1", day1, True, pair),
+            _colour_check("Day 2", day2, False, pair),
+            _margin_check(
+                f"Day 2 to sweep Day 1's high by ≥{margin:g} pips", delta, margin,
+                _move_text(pair, delta, "its high went only {n:.1f} pips above Day 1's high",
+                           "its high stayed {n:.1f} pips below Day 1's high", "its high only matched Day 1's high",
+                           day2.high, day1.high)),
             Check("Day 2 to stay above Day 1's low", day2.low > day1.low,
                   _compare(pair, "Day 2 low", day2.low, "Day 1 low", day1.low)),
         ]
+    delta = (day1.low - day2.low) / pip
     return [
-        Check("Day 1 to close bearish", day1.close < day1.open, close_vs_open("Day 1", day1)),
-        Check("Day 2 to close bullish", day2.close > day2.open, close_vs_open("Day 2", day2)),
-        Check("Day 2 to sweep Day 1's low", day2.low < day1.low,
-              _compare(pair, "Day 2 low", day2.low, "Day 1 low", day1.low)),
+        _colour_check("Day 1", day1, False, pair),
+        _colour_check("Day 2", day2, True, pair),
+        _margin_check(
+            f"Day 2 to sweep Day 1's low by ≥{margin:g} pips", delta, margin,
+            _move_text(pair, delta, "its low went only {n:.1f} pips below Day 1's low",
+                       "its low stayed {n:.1f} pips above Day 1's low", "its low only matched Day 1's low",
+                       day2.low, day1.low)),
         Check("Day 2 to stay below Day 1's high", day2.high < day1.high,
               _compare(pair, "Day 2 high", day2.high, "Day 1 high", day1.high)),
     ]
 
 
-def detect_sweep(day1: DailyCandle, day2: DailyCandle) -> SweepSignal | None:
+def detect_sweep(day1: DailyCandle, day2: DailyCandle, pair: str = "") -> SweepSignal | None:
     """Both candles must already be fully closed — the caller guarantees it."""
-    if all(c.ok for c in sweep_checks(day1, day2, SELL)):
+    if all(c.ok for c in sweep_checks(day1, day2, SELL, pair)):
         return SweepSignal(SELL, day2.open, day2.high)
-    if all(c.ok for c in sweep_checks(day1, day2, BUY)):
+    if all(c.ok for c in sweep_checks(day1, day2, BUY, pair)):
         return SweepSignal(BUY, day2.open, day2.low)
     return None
 
@@ -400,31 +473,36 @@ NO_CONTINUATION = "none"
 
 
 def continuation_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pair: str = "") -> list[Check]:
-    """Every strict condition for a continuation. The first three are the pattern itself; the last
-    two are the exclusions (took the opposite side / gapped past Day 1's extreme).
+    """Every condition for a continuation. The first three are the pattern itself (two real-bodied
+    candles, and a CLOSE at least MIN_BEYOND_PIPS beyond Day 1's extreme); the last two are the strict
+    exclusions (took the opposite side / gapped past Day 1's extreme).
 
     The gap exclusion can effectively never fire on candles built by aggregate_1h_to_daily: Day 2's
     open is Day 1's close, which can't be at or beyond Day 1's high/low unless Day 1 closed exactly
     on it. It stays as a harmless guard (and for candles whose open fell back to the first bar)."""
-    def close_vs_open(day: str, c: DailyCandle) -> str:
-        return _compare(pair, f"{day} close", c.close, "open", c.open)
-
+    pip, margin = pip_size(pair), min_beyond_pips_for(pair)
     if direction == BUY:
+        delta = (day2.close - day1.high) / pip
         return [
-            Check("Day 1 to close bullish", day1.close > day1.open, close_vs_open("Day 1", day1)),
-            Check("Day 2 to close bullish", day2.close > day2.open, close_vs_open("Day 2", day2)),
-            Check("Day 2 to close above Day 1's high", day2.close > day1.high,
-                  _compare(pair, "Day 2 close", day2.close, "Day 1 high", day1.high)),
+            _colour_check("Day 1", day1, True, pair),
+            _colour_check("Day 2", day2, True, pair),
+            _margin_check(
+                f"Day 2 to close ≥{margin:g} pips above Day 1's high", delta, margin,
+                _move_text(pair, delta, "it closed {n:.1f} pips above", "it closed {n:.1f} pips below",
+                           "it closed exactly level", day2.close, day1.high)),
             Check("Day 2 to stay above Day 1's low", day2.low > day1.low,
                   _compare(pair, "Day 2 low", day2.low, "Day 1 low", day1.low)),
             Check("Day 2 to open below Day 1's high (no gap)", day2.open < day1.high,
                   _compare(pair, "Day 2 open", day2.open, "Day 1 high", day1.high)),
         ]
+    delta = (day1.low - day2.close) / pip
     return [
-        Check("Day 1 to close bearish", day1.close < day1.open, close_vs_open("Day 1", day1)),
-        Check("Day 2 to close bearish", day2.close < day2.open, close_vs_open("Day 2", day2)),
-        Check("Day 2 to close below Day 1's low", day2.close < day1.low,
-              _compare(pair, "Day 2 close", day2.close, "Day 1 low", day1.low)),
+        _colour_check("Day 1", day1, False, pair),
+        _colour_check("Day 2", day2, False, pair),
+        _margin_check(
+            f"Day 2 to close ≥{margin:g} pips below Day 1's low", delta, margin,
+            _move_text(pair, delta, "it closed {n:.1f} pips below", "it closed {n:.1f} pips above",
+                       "it closed exactly level", day2.close, day1.low)),
         Check("Day 2 to stay below Day 1's high", day2.high < day1.high,
               _compare(pair, "Day 2 high", day2.high, "Day 1 high", day1.high)),
         Check("Day 2 to open above Day 1's low (no gap)", day2.open > day1.low,
@@ -432,9 +510,9 @@ def continuation_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pa
     ]
 
 
-def classify_continuation(day1: DailyCandle, day2: DailyCandle) -> str:
+def classify_continuation(day1: DailyCandle, day2: DailyCandle, pair: str = "") -> str:
     for direction, label in ((BUY, CONT_BUY), (SELL, CONT_SELL)):
-        checks = continuation_checks(day1, day2, direction)
+        checks = continuation_checks(day1, day2, direction, pair)
         if all(c.ok for c in checks[:3]):
             if not checks[3].ok:
                 return SKIP_OPPOSITE
@@ -444,9 +522,9 @@ def classify_continuation(day1: DailyCandle, day2: DailyCandle) -> str:
     return NO_CONTINUATION
 
 
-def detect_continuation(day1: DailyCandle, day2: DailyCandle) -> ContinuationSignal | None:
+def detect_continuation(day1: DailyCandle, day2: DailyCandle, pair: str = "") -> ContinuationSignal | None:
     """Both candles must already be fully closed — the caller guarantees it."""
-    result = classify_continuation(day1, day2)
+    result = classify_continuation(day1, day2, pair)
     if result == CONT_BUY:
         return ContinuationSignal(BUY, day1.high, day2.open, day2.low)
     if result == CONT_SELL:
@@ -475,12 +553,14 @@ def should_catch_up(last_scanned_day: datetime.date | None, now_utc: datetime.da
 def _failed_lines(day1: DailyCandle, day2: DailyCandle, pair: str, checks_for) -> list[str]:
     """Failed checks for the direction Day 1's colour points to (bullish -> SELL sweep / BUY continuation,
     bearish -> the other way), each as "✗ needs X — but Y" with the actual numbers."""
-    if day1.close == day1.open:
-        return [f"Day 1 closed flat ({_compare(pair, 'close', day1.close, 'open', day1.open)}) — neither direction applies"]
-    bullish = day1.close > day1.open
-    direction, label = checks_for(bullish)
-    failed = [c.failure_text() for c in direction if not c.ok]
-    return [label] + failed
+    bullish, bearish = is_bullish(day1, pair), is_bearish(day1, pair)
+    if not bullish and not bearish:
+        return [
+            f"✗ Day 1 is a doji (body {abs(body_pips(day1, pair)):.1f} pips < {min_body_pips_for(pair):g})"
+            " — neither direction applies"
+        ]
+    checks, label = checks_for(bullish)
+    return [label] + [c.failure_text() for c in checks if not c.ok]
 
 
 def explain_no_setup(day1: DailyCandle, day2: DailyCandle, pair: str = "") -> list[str]:
@@ -531,6 +611,19 @@ class SetupState:
     def final_stage(self) -> int:
         return 2 if self.kind == CONTINUATION_KIND else 1
 
+    @property
+    def levels_apart_pips(self) -> float | None:
+        """Distance between a continuation's two levels, in pips (None for sweeps)."""
+        if self.kind != CONTINUATION_KIND or self.level2 is None:
+            return None
+        return abs(self.level - self.level2) / pip_size(self.pair)
+
+    @property
+    def merged(self) -> bool:
+        """Levels within MERGE_LEVELS_PIPS are one zone: a single alert when Level 1 is reached."""
+        apart = self.levels_apart_pips
+        return apart is not None and apart <= merge_levels_pips_for(self.pair) + _PIP_EPS
+
     def next_stage(self, price: float) -> int | None:
         """The stage this price would move the setup to, or None if it fires nothing. A price past
         both continuation levels at stage 0 jumps straight to 2 (one combined message)."""
@@ -539,6 +632,8 @@ class SetupState:
         if self.stage == 0:
             if not level_reached(self.direction, self.level, price):
                 return None
+            if self.merged:
+                return 2  # one zone: reaching Level 1 completes the setup
             if self.kind == CONTINUATION_KIND and level_reached(self.direction, self.level2, price):
                 return 2
             return 1
@@ -599,6 +694,8 @@ def format_new_setups_digest(
             lines.append(f"{emoji} <b>{x.pair}</b> {x.direction}")
             lines.append(f"   ① Day 1 {side}: {format_price(x.pair, x.level)}")
             lines.append(f"   ② Day 2 open: {format_price(x.pair, x.level2)}{suffix(x)}")
+            if x.merged:
+                lines.append(f"   single alert (levels {x.levels_apart_pips:.1f} pips apart)")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     if len(expiries) == 1:
         lines.append(f"⏳ Valid until Day 3 close: {_wat_str(next(iter(expiries)))}")
@@ -641,6 +738,13 @@ def format_level_hit(
     )
 
 
+def _single_alert_note(pair: str, signal: "ContinuationSignal") -> str:
+    apart = abs(signal.level - signal.level2) / pip_size(pair)
+    if apart <= merge_levels_pips_for(pair) + _PIP_EPS:
+        return f" — single alert (levels {apart:.1f} pips apart)"
+    return ""
+
+
 def format_continuation_hit(
     setup: SetupState,
     price: float,
@@ -648,6 +752,7 @@ def format_continuation_hit(
     hit: str,  # "1" | "2" | "both"
     pre_armed: bool = False,
 ) -> str:
+    """`both` for a merged setup (levels within MERGE_LEVELS_PIPS) is ONE zone alert at Level 1."""
     pair = setup.pair
     is_buy = setup.direction == BUY
     broken = "High" if is_buy else "Low"
@@ -673,10 +778,17 @@ def format_continuation_hit(
     else:
         title = "CONTINUATION · LEVELS 1 & 2 HIT"
         body = [level1_line, f"② <b>Day 2 Open:</b> {l2}", current, stop_line]
-        explanation = (
-            f"⚠️ Price went through the broken Day 1 {broken.lower()} and on to Day 2's open — "
-            "the deepest level for this setup."
-        )
+        if setup.merged:
+            close_word = "bullish close above" if is_buy else "bearish close below"
+            explanation = (
+                f"✅ Price pulled back to the broken Day 1 {broken.lower()} after a {close_word} it.\n"
+                f"ℹ️ Levels are only {setup.levels_apart_pips:.1f} pips apart — treated as one zone."
+            )
+        else:
+            explanation = (
+                f"⚠️ Price went through the broken Day 1 {broken.lower()} and on to Day 2's open — "
+                "the deepest level for this setup."
+            )
     return (
         f"🎯 <b>{title} — {pair} ({setup.direction})</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -987,12 +1099,14 @@ class DailySweepService:
         day1, day2 = days
 
         # The same candles feed both features; a Day 2 can match at most one of the four patterns
-        signal: SweepSignal | ContinuationSignal | None = detect_sweep(day1, day2) or detect_continuation(day1, day2)
+        signal: SweepSignal | ContinuationSignal | None = detect_sweep(day1, day2, pair) or detect_continuation(
+            day1, day2, pair
+        )
         if signal is None:
             logger.info(
                 f"[DailySweep] {pair} no setup — "
                 + " ".join(explain_no_setup(day1, day2, pair))
-                + f" | continuation: {classify_continuation(day1, day2)} "
+                + f" | continuation: {classify_continuation(day1, day2, pair)} "
                 + " ".join(explain_no_continuation(day1, day2, pair))
             )
             return PairScan(pair, "none")
@@ -1186,7 +1300,8 @@ class DailySweepService:
                     f"📈 CONTINUATION {emoji} <b>{s.pair}</b> {s.direction}\n"
                     f"   ① Day 1 {side}: {format_price(s.pair, s.level)} — {hit1}\n"
                     f"   ② Day 2 open: {format_price(s.pair, s.level2)} — {hit2}\n"
-                    f"   Expires: {_wat_str(s.day3_expires_at)}"
+                    + (f"   single alert (levels {s.levels_apart_pips:.1f} pips apart)\n" if s.merged else "")
+                    + f"   Expires: {_wat_str(s.day3_expires_at)}"
                 )
             else:
                 lines.append(
@@ -1233,7 +1348,7 @@ class DailySweepService:
             if day1.range < threshold or day2.range < threshold:
                 lines.append("⚠️ Not evaluated: a candle has a degenerate range (frozen/stale data?).")
             else:
-                signal = detect_sweep(day1, day2)
+                signal = detect_sweep(day1, day2, pair)
                 if signal is None:
                     head, *failed = explain_no_setup(day1, day2, pair)
                     # < and > in the numbers must be escaped: this message is sent as Telegram HTML
@@ -1246,10 +1361,10 @@ class DailySweepService:
                         f"{format_price(pair, signal.level)}, valid until "
                         f"{_wat_str(day3_expiry(day2.date))}"
                     )
-                continuation = detect_continuation(day1, day2)
+                continuation = detect_continuation(day1, day2, pair)
                 if continuation is None:
                     head, *failed = explain_no_continuation(day1, day2, pair)
-                    lines.append(f"📈 Continuation: {classify_continuation(day1, day2)} — {html.escape(head)}")
+                    lines.append(f"📈 Continuation: {classify_continuation(day1, day2, pair)} — {html.escape(head)}")
                     lines.extend(f"   {html.escape(line)}" for line in failed)
                 else:
                     emoji = "🔻" if continuation.direction == SELL else "🔺"
@@ -1257,7 +1372,8 @@ class DailySweepService:
                     lines.append(
                         f"{emoji} <b>Continuation {continuation.direction} setup</b> — "
                         f"① Day 1 {side} {format_price(pair, continuation.level)}, "
-                        f"② Day 2 open {format_price(pair, continuation.level2)}, valid until "
+                        f"② Day 2 open {format_price(pair, continuation.level2)}"
+                        f"{_single_alert_note(pair, continuation)}, valid until "
                         f"{_wat_str(day3_expiry(day2.date))}"
                     )
         return "\n".join(lines)
