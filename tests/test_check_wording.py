@@ -23,7 +23,7 @@ def test_eurnzd_example_sweep_sell_failures_use_the_actual_numbers():
     d1, d2 = candle(MON, *MON_C), candle(TUE, *TUE_C)
     assert _failed(sm.sweep_checks(d1, d2, SELL, "EURNZD")) == [
         "✗ needs Day 2 to sweep Day 1's high by ≥3 pips — but its high stayed 31.6 pips below Day 1's high (1.96841 vs 1.97157)",
-        "✗ needs Day 2 to stay above Day 1's low — but Day 2 low 1.95395 < Day 1 low 1.96441",
+        "✗ needs Day 2 to stay ≥2 pips above Day 1's low — but it went 104.6 pips beyond (1.95395 vs 1.96441)",
     ]  # the two passing checks (Day 1 bullish, Day 2 bearish) are not listed
 
 
@@ -49,7 +49,7 @@ def test_buy_sweep_wording():
     d1, d2 = candle(MON, 105, 110, 90, 95), candle(TUE, 95, 112, 92, 100)  # bearish, bullish, low held, high swept
     assert _failed(sm.sweep_checks(d1, d2, BUY, "EURUSD")) == [
         "✗ needs Day 2 to sweep Day 1's low by ≥3 pips — but its low stayed 20000.0 pips above Day 1's low (92.00000 vs 90.00000)",
-        "✗ needs Day 2 to stay below Day 1's high — but Day 2 high 112.00000 > Day 1 high 110.00000",
+        "✗ needs Day 2 to stay ≥2 pips below Day 1's high — but it went 20000.0 pips beyond (112.00000 vs 110.00000)",
     ]
 
 
@@ -60,7 +60,7 @@ def test_continuation_failures_use_the_actual_numbers():
     assert failed == [
         "✗ needs Day 2 to close bullish — but Day 2 close 1.95849 < open 1.96693",
         "✗ needs Day 2 to close ≥3 pips above Day 1's high — but it closed 130.8 pips below (1.95849 vs 1.97157)",
-        "✗ needs Day 2 to stay above Day 1's low — but Day 2 low 1.95395 < Day 1 low 1.96441",
+        "✗ needs Day 2 to stay ≥2 pips above Day 1's low — but it went 104.6 pips beyond (1.95395 vs 1.96441)",
     ]  # the no-gap check passed (open 1.96693 < Day 1 high 1.97157), so it isn't listed
 
 
@@ -103,7 +103,7 @@ def test_sweepcheck_message_wording_and_is_valid_telegram_html():
     text = _check_message(MON_C, TUE_C, ny(2026, 10, 27, 17, 10))
     assert "🔁 Sweep: no setup — SELL sweep (Day 1 closed bullish):" in text
     assert "✗ needs Day 2 to sweep Day 1&#x27;s high by ≥3 pips — but its high stayed 31.6 pips below Day 1&#x27;s high (1.96841 vs 1.97157)" in text
-    assert "✗ needs Day 2 to stay above Day 1&#x27;s low — but Day 2 low 1.95395 &lt; Day 1 low 1.96441" in text
+    assert "✗ needs Day 2 to stay ≥2 pips above Day 1&#x27;s low — but it went 104.6 pips beyond (1.95395 vs 1.96441)" in text
     assert "📈 Continuation: none — BUY continuation (Day 1 closed bullish):" in text
     # Telegram HTML: a raw < or > anywhere but in the <b> tags we use makes the whole message fail to send
     assert "<" not in re.sub(r"</?b>", "", text) and ">" not in re.sub(r"</?b>", "", text)

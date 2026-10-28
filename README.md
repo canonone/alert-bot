@@ -138,12 +138,14 @@ a default constant in `app/services/daily_sweep_service.py` with a per-pair over
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `MIN_BEYOND_PIPS` (`PAIR_MIN_BEYOND_PIPS`) | 3 | A continuation's Day 2 **close** must be at least this far beyond Day 1's high (BUY) / low (SELL); a sweep's Day 2 **wick** must go at least this far beyond Day 1's high (SELL) / low (BUY). The "didn't take the opposite side" checks stay strict. |
+| `MIN_BEYOND_PIPS` (`PAIR_MIN_BEYOND_PIPS`) | 3 | A continuation's Day 2 **close** must be at least this far beyond Day 1's high (BUY) / low (SELL); a sweep's Day 2 **wick** must go at least this far beyond Day 1's high (SELL) / low (BUY). |
+| `OPPOSITE_SIDE_BUFFER_PIPS` (`PAIR_OPPOSITE_SIDE_BUFFER_PIPS`) | 2 | Day 2 only counts as *not having taken* Day 1's opposite extreme if it stayed at least this many pips away from it (sweep SELL: low ≥ Day 1 low + buffer; sweep BUY: high ≤ Day 1 high − buffer; continuation BUY: low ≥ Day 1 low + buffer; continuation SELL: high ≤ Day 1 high − buffer). Twelve Data's extremes can sit a fraction of a pip inside FOREX.com's, so a near-touch counts as a touch. Exactly the buffer counts as clear; anything closer is taken. |
 | `MIN_BODY_PIPS` (`PAIR_MIN_BODY_PIPS`) | 2 | A day is only bullish/bearish if `|close − open|` is at least this. Anything smaller is a doji and matches neither pattern. |
 | `MERGE_LEVELS_PIPS` (`PAIR_MERGE_LEVELS_PIPS`) | 3 | When a continuation's Level 1 and Level 2 are within this many pips, they are one zone: ONE combined alert when Level 1 is reached (with a note that the levels are only X pips apart), and the setup is complete. `/sweepcheck`, `/sweeps` and the digest show "single alert (levels X pips apart)". |
 
 `/sweepcheck` lists every failed check with the numbers, e.g.
 `✗ needs Day 2 to close ≥3 pips above Day 1's high — but it closed 0.1 pips above (112.408 vs 112.407)`
+`✗ needs Day 2 to stay ≥2 pips below Day 1's high — but it came within 0.2 pips (0.70403 vs 0.70405)`
 and `✗ Day 2 is a doji (body 1.1 pips < 2)`. Whether levels are merged is decided from the stored
 levels and the current setting, so changing `MERGE_LEVELS_PIPS` also applies to setups already armed.
 
