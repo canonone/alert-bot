@@ -112,7 +112,7 @@ async def run_production(
     else:
         logger.error("❌ Webhook registration failed")
 
-    logger.info(f"Price Alert Bot running [{config.NODE_ENV}]")
+    logger.info(f"Price Alert Bot running — webhook mode [NODE_ENV={config.NODE_ENV}]")
 
     fastapi_app = create_webhook_app(application, config.TELEGRAM_BOT_TOKEN)
     server = uvicorn.Server(uvicorn.Config(fastapi_app, host="0.0.0.0", port=config.PORT, log_level="warning"))
@@ -134,7 +134,7 @@ def run_development(
 ) -> None:
     async def post_init(app: Application) -> None:
         await _start_common(app, telegram_bot_service, finnhub_price_service)
-        logger.info(f"Price Alert Bot running [{config.NODE_ENV}]")
+        logger.info(f"Price Alert Bot running — polling mode [NODE_ENV={config.NODE_ENV}]")
 
     async def post_shutdown(app: Application) -> None:
         await finnhub_price_service.stop()
@@ -142,7 +142,9 @@ def run_development(
     application.post_init = post_init
     application.post_shutdown = post_shutdown
 
-    logger.info("Development mode — using polling")
+    if config.IS_PRODUCTION:
+        # Polling is chosen whenever there is no webhook URL, whatever NODE_ENV says
+        logger.warning("NODE_ENV=production but WEBHOOK_URL is empty — falling back to polling")
     application.run_polling(allowed_updates=["message"])
 
 
