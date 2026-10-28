@@ -121,7 +121,7 @@ class MarketDataService:
             logger.error(f"Batch price fetch failed: {error}")
             return {}, False
 
-    # ── Get recent OHLC candles (used by the 4H retracement-zone feature) ──
+    # ── Get recent OHLC candles (used by the Daily Sweep feature, which aggregates 1H bars) ──
     # Returns (candles, quota_exceeded). Each candle: {datetime (aware UTC), open, high, low, close}.
     # Sorted oldest-first regardless of the order Twelve Data returns them in.
 

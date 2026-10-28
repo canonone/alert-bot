@@ -384,8 +384,7 @@ class PriceAlertService:
         if alert.type == "TARGET":
             invalidation = alert.invalidation_price
             if invalidation is not None:
-                # Tie-break: INVALIDATED wins on same-tick ambiguity (matches
-                # RetracementZoneService.check_tick's convention).
+                # Tie-break: INVALIDATED wins on same-tick ambiguity (checked first).
                 if self._level_crossed(float(invalidation), current_price, previous_price):
                     return "INVALIDATED"
                 if self._level_crossed(target, current_price, previous_price):

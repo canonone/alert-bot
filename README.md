@@ -79,8 +79,11 @@ Tables are created automatically on first run.
 | `/cancelalerts [SYMBOL or all]` | Cancel by symbol or all |
 | `/price [PAIR]` | Get live price |
 | `/pairs` | List supported pairs |
-| `/xauzone [PAIR]` | Current 4H retracement-zone status (default XAUUSD) |
-| `/zonealerts [on\|off]` | Opt in/out of 4H zone notifications |
+| `/sweepalerts [on\|off]` | Opt in/out of Daily Sweep notifications |
+| `/contalerts [on\|off]` | Opt in/out of Daily Continuation notifications (separate from sweeps) |
+| `/sweeps` (or `/setups`) | List all active setups — sweeps and continuations (pair, direction, level(s), which continuation level is hit, expiry in WAT) |
+| `/sweepcheck [PAIR]` | Show the last two completed daily candles as the bot built them, and whether they form a sweep or continuation setup |
+| `/sweepscan` | Admin only: run the daily scan (both features) now |
 | `/help` | Full command list |
 
 ### Alert Types
@@ -88,14 +91,88 @@ Tables are created automatically on first run.
 - `TP` — fires when price rises to level
 - `TARGET` — fires when price crosses through the level (real-time tick feed)
 
-### 4H Retracement Zone ("OTE") Alerts
-Requires `TWELVE_DATA_API_KEY` (server-level) in `.env` — disabled otherwise. Tracks each
-configured pair's (default `XAUUSD`) completed 4H candles, classifies bias, and computes the
-midpoint (50%) of that candle's range as the trigger price (direction-independent — same value
-either way). While the next 4H candle forms, live Finnhub ticks are checked against that trigger
-and fire one-shot `ZONE_ENTRY` and `INVALIDATED` alerts (invalidated if price breaks the prior
-candle's opposite extreme first) to opted-in users (`/zonealerts on`). See
-`scripts/inspect_4h_candles.py` to inspect Twelve Data's actual 4H candle boundary alignment.
+### Daily Sweep Alerts
+Requires `TWELVE_DATA_API_KEY` (server-level) in `.env` — disabled otherwise. Opt in with
+`/sweepalerts on` (approved users only).
+
+**Pattern** (daily timeframe, all comparisons strict, evaluated only after Day 2 has fully closed):
+
+- **SELL** — Day 1 closes bullish, Day 2 closes bearish, Day 2's high > Day 1's high (sweep) and
+  Day 2's low > Day 1's low (no low sweep). Level = Day 2's open. During Day 3, alert when price
+  trades up to the level.
+- **BUY** — the mirror: Day 1 bearish, Day 2 bullish, Day 2's low < Day 1's low and Day 2's high <
+  Day 1's high. Alert when Day 3 price trades down to Day 2's open.
+
+If the level isn't reached by the time Day 3 closes, the setup expires silently. Each setup fires
+at most once.
+
+### Daily Continuation Alerts
+Runs on the same candles, scan, tick feed and storage as Daily Sweep — each pair is fetched once
+per scan and checked for both patterns. Opt in with `/contalerts on` (independent of
+`/sweepalerts`). Day 2 must be fully closed; all comparisons are strict.
+
+- **BUY** — Day 1 and Day 2 both close bullish, Day 2 closes above Day 1's high, Day 2's low >
+  Day 1's low (it didn't take the low), and Day 2 opened below Day 1's high (no gap).
+  Level 1 = Day 1's high, Level 2 = Day 2's open (always below Level 1).
+- **SELL** — the mirror: both bearish, Day 2 closes below Day 1's low, Day 2's high < Day 1's
+  high, Day 2 opened above Day 1's low. Level 1 = Day 1's low, Level 2 = Day 2's open.
+
+During Day 3 the levels fire in order: Level 1 first (price pulls back to the broken extreme),
+then Level 2. A price already past both fires one combined message. Each stage is claimed with an
+atomic database update, so it can never be sent twice. At Day 3's close the setup expires silently,
+whether nothing or only Level 1 was hit. The suggested stop is Day 2's low (BUY) / high (SELL).
+A Day 2 can match only one of the four patterns (the Day 1/Day 2 colour combination decides it).
+
+**Daily candles.** A trading day runs 17:00 → 17:00 `America/New_York` (matching FOREX.com on
+TradingView), built by aggregating Twelve Data 1H bars — Twelve Data's own `1day` candles use
+midnight UTC and don't match. US daylight saving is handled by `zoneinfo` (hence the `tzdata`
+requirement). Sunday evening's session belongs to Monday; weekend/frozen bars are discarded, so
+the day before Monday is Friday. A day is only used if its final bar (16:00–17:00 NY) is present and it has at least 22 bars
+(`PAIR_MIN_DAILY_BARS` overrides per pair — gold has a daily 17:00–18:00 break) and its range isn't
+degenerate; Day 1 and Day 2 must be consecutive trading days.
+
+**Scan.** Every Mon–Fri at 17:10 New York time, each pair in `ALLOWED_SYMBOLS` is fetched (one
+request per pair, ~8 s apart for Twelve Data's 8 req/min free tier — about 29 requests/day).
+Pairs whose latest day hasn't appeared yet (or that hit a quota error) are retried once 15
+minutes later. Each pair's computed Day 1 / Day 2 OHLC is logged on every scan. New setups are
+sent as one digest; live Finnhub ticks then trigger level-hit alerts. Setups are stored in
+`daily_sweep_setups`, so they survive restarts. If the latest closed trading day hasn't been scanned when the bot starts
+(e.g. it was down at 17:10) and its Day 3 is still running, a catch-up scan runs in the background.
+If the current price (latest Finnhub tick if under 2 minutes old, else Twelve Data) is already at/through a new setup's level, the alert fires immediately
+with a note that the level was reached before the setup was armed.
+
+**Known limitation.** Candles come from Twelve Data, live ticks from Finnhub (OANDA), and your
+chart from FOREX.com. These are three different feeds, so levels can differ by a few pips or
+cents from what you see on TradingView. Use `/sweepcheck PAIR` (or the scan logs) to compare the
+bot's candles against your chart.
+
+---
+
+## Upgrading
+
+The app creates missing tables on startup (so `daily_sweep_setups` appears automatically) and adds
+the `users.daily_sweep_alerts_enabled` column if it's missing. Nothing is ever dropped at runtime.
+After upgrading from a version with the 4H zone feature, run this once to clean up the old schema:
+
+```sql
+DROP TABLE IF EXISTS retracement_zones;
+ALTER TABLE users DROP COLUMN IF EXISTS zone_alerts_enabled;
+```
+
+## Tests
+
+```bash
+pip install pytest
+pytest
+```
+
+`tests/test_integration_postgres.py` runs the real SQL (schema upgrade, unique constraint, staged claims,
+expiry, scan state, opt-in flags) and is skipped unless `TEST_DATABASE_URL` is set. It works inside a
+throwaway schema that it drops afterwards, so it is safe to point at any database:
+
+```bash
+TEST_DATABASE_URL=postgresql+asyncpg://user:pass@127.0.0.1:5432/dbname pytest tests/test_integration_postgres.py
+```
 
 ---
 
@@ -105,14 +182,14 @@ candle's opposite extreme first) to opted-in users (`/zonealerts on`). See
 app/
 ├── services/
 │   ├── users_service.py           # User registration + API key storage
-│   ├── market_data_service.py     # Twelve Data price + candle fetching (per-user key, or server key for zones)
+│   ├── market_data_service.py     # Twelve Data price + candle fetching (per-user key, or server key for Daily Sweep)
 │   ├── price_alert_service.py     # Alert CRUD + trigger logic
 │   ├── invite_service.py          # Invite-code generation/redemption
-│   ├── retracement_zone_service.py # 4H candle retracement ("OTE") zone tracking + alerts
+│   ├── daily_sweep_service.py     # Daily Sweep: 17:00-NY daily candles, pattern scan, live level alerts
 │   └── finnhub_price_service.py   # Live Finnhub WebSocket feed
 ├── telegram_bot.py                # All bot commands + message routing
 ├── webhook.py                     # FastAPI app exposing POST /webhook/<token> (production only)
-├── scheduler.py                   # Daily cleanup + alert-ID reset jobs
+├── scheduler.py                   # Friday cleanup + alert-ID reset jobs, Daily Sweep scan (17:10 NY)
 ├── db.py / models.py              # SQLAlchemy async models + engine
 ├── config.py                      # Environment variable loading
 └── main.py                        # Entrypoint — polling (dev) / FastAPI+uvicorn webhook (prod)

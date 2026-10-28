@@ -1,6 +1,6 @@
 import logging
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 
 from app import config
 from app.db import SessionLocal
@@ -101,16 +101,43 @@ class UsersService:
     def is_admin_chat_id(self, chat_id: str) -> bool:
         return chat_id == self.admin_chat_id
 
-    # ── 4H retracement-zone alert opt-in ───────────────────────────
+    # ── Daily Sweep alert opt-in ──────────────────────────────────
 
-    async def set_zone_alerts_enabled(self, chat_id: str, enabled: bool) -> None:
+    async def set_daily_sweep_alerts_enabled(self, chat_id: str, enabled: bool) -> None:
         async with SessionLocal() as session:
-            await session.execute(update(User).where(User.chat_id == chat_id).values(zone_alerts_enabled=enabled))
+            await session.execute(
+                update(User).where(User.chat_id == chat_id).values(daily_sweep_alerts_enabled=enabled)
+            )
             await session.commit()
 
-    async def find_zone_alert_subscribers(self) -> list[User]:
+    async def set_daily_continuation_alerts_enabled(self, chat_id: str, enabled: bool) -> None:
+        async with SessionLocal() as session:
+            await session.execute(
+                update(User).where(User.chat_id == chat_id).values(daily_continuation_alerts_enabled=enabled)
+            )
+            await session.commit()
+
+    async def find_daily_continuation_subscribers(self) -> list[User]:
         async with SessionLocal() as session:
             result = await session.execute(
-                select(User).where(User.zone_alerts_enabled.is_(True), User.is_approved.is_(True))
+                select(User).where(User.daily_continuation_alerts_enabled.is_(True), User.is_approved.is_(True))
+            )
+            return list(result.scalars().all())
+
+    async def find_digest_subscribers(self) -> list[User]:
+        """Approved users opted into at least one of Daily Sweep / Daily Continuation."""
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(User).where(
+                    User.is_approved.is_(True),
+                    or_(User.daily_sweep_alerts_enabled.is_(True), User.daily_continuation_alerts_enabled.is_(True)),
+                )
+            )
+            return list(result.scalars().all())
+
+    async def find_daily_sweep_subscribers(self) -> list[User]:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(User).where(User.daily_sweep_alerts_enabled.is_(True), User.is_approved.is_(True))
             )
             return list(result.scalars().all())

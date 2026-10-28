@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 from typing import Any
@@ -40,7 +41,10 @@ class TelegramBotService:
         # Wired up after construction in main.py (avoids circular imports)
         self.bot: Bot | None = None
         self.finnhub_price_service: Any = None
-        self.retracement_zone_service: Any = None
+        self.daily_sweep_service: Any = None
+
+        # Strong refs to fire-and-forget tasks (manual sweep scans) so they aren't garbage collected
+        self._background_tasks: set[asyncio.Task] = set()
 
     # ── PTB entrypoint ────────────────────────────────────────────
 
@@ -87,6 +91,9 @@ class TelegramBotService:
             if command == "/revokecode":
                 await self._handle_revokecode(chat_id, parts)
                 return
+            if command == "/sweepscan":
+                await self._handle_sweepscan(chat_id)
+                return
 
         # All other commands require approval first
         user = await self.users_service.find_by_chat_id(chat_id)
@@ -116,10 +123,14 @@ class TelegramBotService:
             await self._handle_price(chat_id, parts)
         elif command == "/pairs":
             await self._handle_pairs(chat_id)
-        elif command == "/xauzone":
-            await self._handle_xauzone(chat_id, parts)
-        elif command == "/zonealerts":
-            await self._handle_zonealerts(chat_id, parts)
+        elif command == "/sweepalerts":
+            await self._handle_sweepalerts(chat_id, parts)
+        elif command == "/contalerts":
+            await self._handle_contalerts(chat_id, parts)
+        elif command in ("/sweeps", "/setups"):
+            await self._handle_sweeps(chat_id)
+        elif command == "/sweepcheck":
+            await self._handle_sweepcheck(chat_id, parts)
 
     # ── /start ────────────────────────────────────────────────────
 
@@ -426,30 +437,82 @@ class TelegramBotService:
     async def _handle_pairs(self, chat_id: str) -> None:
         await self.send_message_to_user(chat_id, self.price_alert_service.get_supported_pairs_message())
 
-    # ── /xauzone ──────────────────────────────────────────────────
+    # ── Daily Sweep ───────────────────────────────────────────────
 
-    async def _handle_xauzone(self, chat_id: str, parts: list[str]) -> None:
-        if self.retracement_zone_service is None:
-            await self.send_message_to_user(chat_id, "❌ The 4H zone feature is not configured on this server.")
-            return
-        pair = parts[1].upper() if len(parts) >= 2 else "XAUUSD"
-        await self.send_message_to_user(chat_id, self.retracement_zone_service.get_status_message(pair))
+    async def _sweep_unavailable(self, chat_id: str) -> bool:
+        if self.daily_sweep_service is None:
+            await self.send_message_to_user(chat_id, "❌ The Daily Sweep feature is not configured on this server.")
+            return True
+        return False
 
-    # ── /zonealerts ───────────────────────────────────────────────
-
-    async def _handle_zonealerts(self, chat_id: str, parts: list[str]) -> None:
-        if self.retracement_zone_service is None:
-            await self.send_message_to_user(chat_id, "❌ The 4H zone feature is not configured on this server.")
+    async def _handle_sweepalerts(self, chat_id: str, parts: list[str]) -> None:
+        if await self._sweep_unavailable(chat_id):
             return
         if len(parts) != 2 or parts[1].lower() not in ("on", "off"):
             await self.send_message_to_user(
-                chat_id, "❌ Usage: <code>/zonealerts on</code> or <code>/zonealerts off</code>"
+                chat_id, "❌ Usage: <code>/sweepalerts on</code> or <code>/sweepalerts off</code>"
             )
             return
         enabled = parts[1].lower() == "on"
-        await self.users_service.set_zone_alerts_enabled(chat_id, enabled)
+        await self.users_service.set_daily_sweep_alerts_enabled(chat_id, enabled)
         status = "enabled ✅" if enabled else "disabled ❌"
-        await self.send_message_to_user(chat_id, f"4H zone alerts {status}.")
+        await self.send_message_to_user(chat_id, f"Daily Sweep alerts {status}.")
+
+    async def _handle_contalerts(self, chat_id: str, parts: list[str]) -> None:
+        if await self._sweep_unavailable(chat_id):
+            return
+        if len(parts) != 2 or parts[1].lower() not in ("on", "off"):
+            await self.send_message_to_user(
+                chat_id, "❌ Usage: <code>/contalerts on</code> or <code>/contalerts off</code>"
+            )
+            return
+        enabled = parts[1].lower() == "on"
+        await self.users_service.set_daily_continuation_alerts_enabled(chat_id, enabled)
+        status = "enabled ✅" if enabled else "disabled ❌"
+        await self.send_message_to_user(chat_id, f"Daily Continuation alerts {status}.")
+
+    async def _handle_sweeps(self, chat_id: str) -> None:
+        if await self._sweep_unavailable(chat_id):
+            return
+        await self.send_message_to_user(chat_id, await self.daily_sweep_service.get_sweeps_message())
+
+    async def _handle_sweepcheck(self, chat_id: str, parts: list[str]) -> None:
+        if await self._sweep_unavailable(chat_id):
+            return
+        if len(parts) != 2:
+            await self.send_message_to_user(
+                chat_id, "❌ Usage: <code>/sweepcheck [PAIR]</code>\n\nExample: <code>/sweepcheck XAUUSD</code>"
+            )
+            return
+        await self.send_message_to_user(chat_id, await self.daily_sweep_service.get_check_message(parts[1]))
+
+    async def _handle_sweepscan(self, chat_id: str) -> None:
+        if await self._sweep_unavailable(chat_id):
+            return
+        if self.daily_sweep_service.scan_running:
+            await self.send_message_to_user(chat_id, "⏳ A Daily Sweep scan is already running.")
+            return
+        await self.send_message_to_user(
+            chat_id,
+            "🔄 Daily setup scan started. Requests are spaced to respect the Twelve Data rate limit, "
+            "so this takes a few minutes — I'll message you when it finishes.",
+        )
+        # A scan takes minutes; running it inline would block every other Telegram update
+        task = asyncio.create_task(self._run_manual_sweep_scan(chat_id))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _run_manual_sweep_scan(self, chat_id: str) -> None:
+        try:
+            report = await self.daily_sweep_service.run_scan()
+        except Exception as error:
+            logger.error(f"Manual Daily Sweep scan failed: {error}")
+            await self.send_message_to_user(chat_id, f"❌ Daily Sweep scan failed: {html.escape(str(error))}")
+            return
+        message = f"✅ <b>Daily setup scan finished</b>\n\n{html.escape(report.summary())}"
+        if report.retry_pairs:
+            message += f"\n\nNo usable data for: {', '.join(report.retry_pairs)}"
+        await self.send_message_to_user(chat_id, message)
 
     # ── /help ─────────────────────────────────────────────────────
 
@@ -476,9 +539,14 @@ class TelegramBotService:
             "<code>/price [PAIR]</code>\n"
             "<code>/pairs</code>\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>🟡 4H Zones</b>\n\n"
-            "<code>/xauzone [PAIR]</code> — current zone status (default XAUUSD)\n"
-            "<code>/zonealerts [on|off]</code> — zone alert notifications\n\n"
+            "<b>📊 Daily Sweep</b>\n\n"
+            "<code>/sweepalerts [on|off]</code> — Daily Sweep notifications\n"
+            "<code>/sweeps</code> (or <code>/setups</code>) — all active setups\n"
+            "<code>/sweepcheck [PAIR]</code> — last two daily candles + setup check\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>📈 Daily Continuation</b>\n\n"
+            "<code>/contalerts [on|off]</code> — continuation notifications (separate from sweeps)\n"
+            "Same scan, same <code>/sweeps</code> and <code>/sweepcheck</code> commands\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "🔴 SL · 🟢 TP · 🎯 TARGET\n"
             "Real-time price alerts via live feed ⚡"
@@ -490,7 +558,8 @@ class TelegramBotService:
                 "<b>🔑 Admin</b>\n\n"
                 "<code>/gencode [N]</code> — generate invite codes\n"
                 "<code>/listcodes</code> — view all codes\n"
-                "<code>/revokecode [CODE]</code> — delete a code"
+                "<code>/revokecode [CODE]</code> — delete a code\n"
+                "<code>/sweepscan</code> — run the Daily Sweep + Continuation scan now"
             )
 
         await self.send_message_to_user(chat_id, msg)
