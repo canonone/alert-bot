@@ -179,11 +179,11 @@ def test_sweep_buy_one_pip_beyond_is_no_setup_five_pips_is():
     assert signal is not None and signal.direction == BUY and signal.level == 1.1000
 
 
-def test_sweep_still_needs_the_opposite_side_untouched_with_no_margin():
+def test_sweep_needs_the_opposite_side_untouched_by_the_buffer():
     d1 = c(MON, *SELL_D1)
-    # Low 1 pip ABOVE Day 1's low is fine — "didn't take the low" is strict, with no margin
-    assert sweep(d1, c(TUE, 1.1030, 1.1060, 1.0951, 1.1000)) is not None
-    assert sweep(d1, c(TUE, 1.1030, 1.1060, 1.0950, 1.1000)) is None  # equal to the low: taken
+    assert sweep(d1, c(TUE, 1.1030, 1.1060, 1.0952, 1.1000)) is not None  # 2 pips clear of Day 1's low: not taken
+    assert sweep(d1, c(TUE, 1.1030, 1.1060, 1.0951, 1.1000)) is None  # only 1 pip clear: counts as taken
+    assert sweep(d1, c(TUE, 1.1030, 1.1060, 1.0950, 1.1000)) is None  # equal to the low
     assert sweep(d1, c(TUE, 1.1030, 1.1060, 1.0949, 1.1000)) is None  # below it
 
 
@@ -203,8 +203,9 @@ def test_continuation_buy_close_margin():
     assert detect_continuation(d1, c(TUE, *buy_d2(1.10529)), FX) is None  # 2.9 pips
     assert detect_continuation(d1, c(TUE, *buy_d2(1.1053)), FX).direction == BUY  # exactly 3 pips
     assert detect_continuation(d1, c(TUE, *buy_d2(1.1055)), FX).direction == BUY  # 5 pips
-    # "Did not take the low" stays strict: 1 pip above Day 1's low is enough, equal is not
-    assert detect_continuation(d1, c(TUE, *buy_d2(1.1060, low=1.0951)), FX) is not None
+    # "Did not take the low" needs the OPPOSITE_SIDE_BUFFER_PIPS (2): 2 pips clear is enough, 1 pip is a touch
+    assert detect_continuation(d1, c(TUE, *buy_d2(1.1060, low=1.0952)), FX) is not None
+    assert classify_continuation(d1, c(TUE, *buy_d2(1.1060, low=1.0951)), FX) == sm.SKIP_OPPOSITE
     assert classify_continuation(d1, c(TUE, *buy_d2(1.1060, low=1.0950)), FX) == sm.SKIP_OPPOSITE
 
 

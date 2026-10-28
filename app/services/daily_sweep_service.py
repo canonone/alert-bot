@@ -127,6 +127,10 @@ PAIR_MIN_BODY_PIPS: dict[str, float] = {}
 # - Continuation levels this close together (Level 1 vs Level 2) are one zone: one alert, not two.
 MERGE_LEVELS_PIPS = 3.0
 PAIR_MERGE_LEVELS_PIPS: dict[str, float] = {}
+# - Day 2 only counts as NOT having taken Day 1's opposite extreme if it stayed at least this far away
+#   from it. Twelve Data's extremes can sit a fraction of a pip inside FOREX.com's, so a near-touch is a touch.
+OPPOSITE_SIDE_BUFFER_PIPS = 2.0
+PAIR_OPPOSITE_SIDE_BUFFER_PIPS: dict[str, float] = {}
 
 _PIP_EPS = 1e-6  # float slack when comparing pip distances to a threshold
 
@@ -137,6 +141,10 @@ def min_beyond_pips_for(pair: str) -> float:
 
 def min_body_pips_for(pair: str) -> float:
     return PAIR_MIN_BODY_PIPS.get(pair, MIN_BODY_PIPS)
+
+
+def opposite_side_buffer_pips_for(pair: str) -> float:
+    return PAIR_OPPOSITE_SIDE_BUFFER_PIPS.get(pair, OPPOSITE_SIDE_BUFFER_PIPS)
 
 
 def merge_levels_pips_for(pair: str) -> float:
@@ -424,9 +432,24 @@ def _margin_check(needs: str, delta: float, minimum: float, but: str) -> Check:
     return Check(needs, delta >= minimum - _PIP_EPS, but)
 
 
+def _stay_away_check(pair: str, needs_side: str, delta: float, a: float, b: float) -> Check:
+    """"Did not take Day 1's opposite extreme": Day 2 must stay at least the buffer away from it.
+    `delta` is how far inside (positive) or past (negative) the extreme Day 2 stayed, in pips."""
+    buffer = opposite_side_buffer_pips_for(pair)
+    figures = f"({format_price(pair, a)} vs {format_price(pair, b)})"
+    if abs(delta) < _PIP_EPS:
+        but = f"it touched it {figures}"
+    elif delta > 0:
+        but = f"it came within {delta:.1f} pips {figures}"
+    else:
+        but = f"it went {-delta:.1f} pips beyond {figures}"
+    return _margin_check(f"Day 2 to stay ≥{buffer:g} pips {needs_side}", delta, buffer, but)
+
+
 def sweep_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pair: str = "") -> list[Check]:
     """Every condition for `direction` — used by detect_sweep, the scan log and /sweepcheck. The sweep
-    itself needs the wick to go MIN_BEYOND_PIPS past Day 1's extreme; "stay above/below" is strict."""
+    itself needs the wick to go MIN_BEYOND_PIPS past Day 1's extreme, while Day 2 must stay at least
+    OPPOSITE_SIDE_BUFFER_PIPS away from the other extreme."""
     pip, margin = pip_size(pair), min_beyond_pips_for(pair)
     if direction == SELL:
         delta = (day2.high - day1.high) / pip
@@ -438,8 +461,7 @@ def sweep_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pair: str
                 _move_text(pair, delta, "its high went only {n:.1f} pips above Day 1's high",
                            "its high stayed {n:.1f} pips below Day 1's high", "its high only matched Day 1's high",
                            day2.high, day1.high)),
-            Check("Day 2 to stay above Day 1's low", day2.low > day1.low,
-                  _compare(pair, "Day 2 low", day2.low, "Day 1 low", day1.low)),
+            _stay_away_check(pair, "above Day 1's low", (day2.low - day1.low) / pip, day2.low, day1.low),
         ]
     delta = (day1.low - day2.low) / pip
     return [
@@ -450,8 +472,7 @@ def sweep_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pair: str
             _move_text(pair, delta, "its low went only {n:.1f} pips below Day 1's low",
                        "its low stayed {n:.1f} pips above Day 1's low", "its low only matched Day 1's low",
                        day2.low, day1.low)),
-        Check("Day 2 to stay below Day 1's high", day2.high < day1.high,
-              _compare(pair, "Day 2 high", day2.high, "Day 1 high", day1.high)),
+        _stay_away_check(pair, "below Day 1's high", (day1.high - day2.high) / pip, day2.high, day1.high),
     ]
 
 
@@ -475,7 +496,7 @@ NO_CONTINUATION = "none"
 def continuation_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pair: str = "") -> list[Check]:
     """Every condition for a continuation. The first three are the pattern itself (two real-bodied
     candles, and a CLOSE at least MIN_BEYOND_PIPS beyond Day 1's extreme); the last two are the strict
-    exclusions (took the opposite side / gapped past Day 1's extreme).
+    exclusions (came within OPPOSITE_SIDE_BUFFER_PIPS of the opposite extreme / gapped past Day 1's extreme).
 
     The gap exclusion can effectively never fire on candles built by aggregate_1h_to_daily: Day 2's
     open is Day 1's close, which can't be at or beyond Day 1's high/low unless Day 1 closed exactly
@@ -490,8 +511,7 @@ def continuation_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pa
                 f"Day 2 to close ≥{margin:g} pips above Day 1's high", delta, margin,
                 _move_text(pair, delta, "it closed {n:.1f} pips above", "it closed {n:.1f} pips below",
                            "it closed exactly level", day2.close, day1.high)),
-            Check("Day 2 to stay above Day 1's low", day2.low > day1.low,
-                  _compare(pair, "Day 2 low", day2.low, "Day 1 low", day1.low)),
+            _stay_away_check(pair, "above Day 1's low", (day2.low - day1.low) / pip, day2.low, day1.low),
             Check("Day 2 to open below Day 1's high (no gap)", day2.open < day1.high,
                   _compare(pair, "Day 2 open", day2.open, "Day 1 high", day1.high)),
         ]
@@ -503,8 +523,7 @@ def continuation_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pa
             f"Day 2 to close ≥{margin:g} pips below Day 1's low", delta, margin,
             _move_text(pair, delta, "it closed {n:.1f} pips below", "it closed {n:.1f} pips above",
                        "it closed exactly level", day2.close, day1.low)),
-        Check("Day 2 to stay below Day 1's high", day2.high < day1.high,
-              _compare(pair, "Day 2 high", day2.high, "Day 1 high", day1.high)),
+        _stay_away_check(pair, "below Day 1's high", (day1.high - day2.high) / pip, day2.high, day1.high),
         Check("Day 2 to open above Day 1's low (no gap)", day2.open > day1.low,
               _compare(pair, "Day 2 open", day2.open, "Day 1 low", day1.low)),
     ]
