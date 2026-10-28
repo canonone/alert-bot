@@ -19,6 +19,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(message)s",
 )
+# httpx logs every request at INFO, URL included — and Twelve Data takes the API key in the query string
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("Bootstrap")
 
 
