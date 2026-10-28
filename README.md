@@ -137,8 +137,9 @@ requirement). A day's **open is the previous trading day's close** (as on FOREX.
 exactly at Friday's close); a 1H feed's first bar can open well away from that, Monday most of all.
 High, low and close come from the 1H bars. If the previous day is missing or incomplete (or is the
 oldest day in the fetched data) the open falls back to the first 1H bar's open, and the scan logs it.
-Sunday evening's session belongs to Monday; weekend/frozen bars are discarded, so
-the day before Monday is Friday. A day is only used if its final bar (16:00–17:00 NY) is present and it has at least 22 bars
+Sunday evening's session belongs to Monday. Twelve Data keeps quoting through the weekend (those
+bars have real ranges and the price can drift well away from Friday's close), so the bars between
+Friday 17:00 and Sunday 17:00 New York time are dropped by time alone; the day before Monday is Friday. A day is only used if its final bar (16:00–17:00 NY) is present and it has at least 22 bars
 (`PAIR_MIN_DAILY_BARS` overrides per pair — gold has a daily 17:00–18:00 break) and its range isn't
 degenerate; Day 1 and Day 2 must be consecutive trading days.
 
@@ -157,6 +158,10 @@ with a note that the level was reached before the setup was armed.
 chart from FOREX.com. These are three different feeds, so levels can differ by a few pips or
 cents from what you see on TradingView. Use `/sweepcheck PAIR` (or the scan logs) to compare the
 bot's candles against your chart.
+
+In particular, Friday's close can differ from FOREX.com's by a few pips on some pairs (for example
+EURNZD on 23 Oct 2026: 8.7 pips), and because a day's open is the previous close, Monday's open
+inherits that difference. High, low and close can also be a few pips off (typically 0.2–3 pips).
 
 ---
 

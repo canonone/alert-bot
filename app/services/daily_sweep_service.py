@@ -39,7 +39,8 @@ DAY_ROLL_HOUR_NY = 17
 
 ONE_H_INTERVAL = "1h"
 # Day 1 + Day 2 plus the day before Day 1 (its close is Day 1's open), even across a weekend with
-# Twelve Data's frozen Sat/Sun bars: Fri, 48 weekend bars, Mon, Tue ~ 120+, so leave headroom
+# Twelve Data's Sat/Sun bars (it keeps quoting through the weekend): Fri, 48 weekend bars, Mon, Tue
+# ~ 120+, so leave headroom
 ONE_H_LOOKBACK = 168
 
 # Twelve Data's free tier allows 8 requests/minute — one request per pair, spaced 8s apart
@@ -60,9 +61,10 @@ SCAN_HOUR_NY = 17
 SCAN_MINUTE_NY = 10
 
 # Forex/gold markets close for the weekend: Friday 17:00 through Sunday 17:00 New York time.
-# During this window Twelve Data keeps returning "complete" 1H candles for a closed market —
-# same last-traded price repeated with tiny float jitter. (The old 4H feature used a fixed UTC
-# window; New York time is used here so the window follows the daylight-saving shift.)
+# Twelve Data keeps quoting through this window — the 1H bars have real ranges and the price can
+# drift tens of pips away from Friday's close — so they are dropped purely by time, not by looking
+# at the prices. (The old 4H feature used a fixed UTC window; New York time is used here so the
+# window follows the daylight-saving shift.)
 # Weekday numbers follow datetime.weekday(): Monday=0 ... Sunday=6.
 MARKET_CLOSE_WEEKDAY_NY = 4  # Friday
 MARKET_REOPEN_WEEKDAY_NY = 6  # Sunday
