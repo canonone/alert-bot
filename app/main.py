@@ -6,11 +6,11 @@ from telegram.ext import Application, MessageHandler, filters
 
 from app import config, scheduler
 from app.db import init_db
+from app.services.daily_sweep_service import DailySweepService
 from app.services.finnhub_price_service import FinnhubPriceService
 from app.services.invite_service import InviteService
 from app.services.market_data_service import MarketDataService
 from app.services.price_alert_service import PriceAlertService
-from app.services.retracement_zone_service import RetracementZoneService
 from app.services.users_service import UsersService
 from app.telegram_bot import TelegramBotService
 from app.webhook import create_webhook_app
@@ -35,25 +35,26 @@ def build_services() -> tuple[TelegramBotService, FinnhubPriceService]:
         invite_service=invite_service,
     )
 
-    retracement_zone_service: RetracementZoneService | None = None
+    daily_sweep_service: DailySweepService | None = None
     if config.TWELVE_DATA_API_KEY:
-        retracement_zone_service = RetracementZoneService(
+        daily_sweep_service = DailySweepService(
             api_key=config.TWELVE_DATA_API_KEY,
-            pairs=config.RETRACEMENT_ZONE_PAIRS,
             market_data=market_data,
             users_service=users_service,
             send_message=telegram_bot_service.send_message_to_user,
         )
     else:
-        logger.warning("TWELVE_DATA_API_KEY not set — 4H retracement zone feature disabled")
-    telegram_bot_service.retracement_zone_service = retracement_zone_service
+        logger.warning("TWELVE_DATA_API_KEY not set — Daily Sweep feature disabled")
+    telegram_bot_service.daily_sweep_service = daily_sweep_service
 
     finnhub_price_service = FinnhubPriceService(
         price_alert_service=price_alert_service,
         send_message=telegram_bot_service.send_message_to_user,
-        retracement_zone_service=retracement_zone_service,
-        extra_symbols=set(config.RETRACEMENT_ZONE_PAIRS) if retracement_zone_service else set(),
+        daily_sweep_service=daily_sweep_service,
     )
+    if daily_sweep_service is not None:
+        daily_sweep_service.subscribe_symbol = finnhub_price_service.subscribe_to_symbol
+        daily_sweep_service.get_last_price = finnhub_price_service.get_last_tick
     telegram_bot_service.finnhub_price_service = finnhub_price_service
 
     return telegram_bot_service, finnhub_price_service
@@ -74,15 +75,15 @@ async def _start_common(
     finnhub_price_service: FinnhubPriceService,
 ) -> None:
     await init_db()
-    if telegram_bot_service.retracement_zone_service is not None:
-        await telegram_bot_service.retracement_zone_service.bootstrap()
+    if telegram_bot_service.daily_sweep_service is not None:
+        await telegram_bot_service.daily_sweep_service.bootstrap()
     finnhub_price_service.start()
     scheduler.register_jobs(
         application,
         price_alert_service=telegram_bot_service.price_alert_service,
         telegram_bot=telegram_bot_service,
         users_service=telegram_bot_service.users_service,
-        retracement_zone_service=telegram_bot_service.retracement_zone_service,
+        daily_sweep_service=telegram_bot_service.daily_sweep_service,
     )
 
 

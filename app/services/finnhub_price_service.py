@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import logging
 from typing import Any, Awaitable, Callable
@@ -18,21 +19,20 @@ class FinnhubPriceService:
         self,
         price_alert_service: PriceAlertService,
         send_message: SendMessage,
-        retracement_zone_service: Any = None,
-        extra_symbols: set[str] | None = None,
+        daily_sweep_service: Any = None,
     ) -> None:
         self.price_alert_service = price_alert_service
         self.send_message = send_message
         self.finnhub_api_key = config.FINNHUB_API_KEY
 
-        # Optional 4H retracement-zone feature — ticks are forwarded to it when configured
-        self.retracement_zone_service = retracement_zone_service
-        # Symbols to always subscribe to (e.g. zone pairs) even with no active price alert
-        self.extra_symbols = extra_symbols or set()
+        # Optional Daily Sweep feature — ticks are forwarded to it when configured, and every pair
+        # with an ACTIVE setup is subscribed even if nobody has a normal price alert on it
+        self.daily_sweep_service = daily_sweep_service
 
         self.ws: Any | None = None
         self.subscribed_symbols: set[str] = set()
         self.last_price: dict[str, float] = {}
+        self.last_price_at: dict[str, datetime.datetime] = {}  # UTC time of each symbol's latest tick
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 10
 
@@ -89,7 +89,8 @@ class FinnhubPriceService:
 
     async def _subscribe_to_active_symbols(self) -> None:
         grouped = await self.price_alert_service.get_active_alerts_grouped_by_symbol()
-        symbols = list(set(grouped.keys()) | self.extra_symbols)
+        sweep_symbols = self.daily_sweep_service.active_symbols() if self.daily_sweep_service is not None else set()
+        symbols = list(set(grouped.keys()) | sweep_symbols)
 
         if not symbols:
             logger.info("[FinnhubPrice] No active symbols to subscribe")
@@ -129,11 +130,22 @@ class FinnhubPriceService:
                 price = trade["p"]
                 previous_price = self.last_price.get(symbol)
                 self.last_price[symbol] = price
+                self.last_price_at[symbol] = datetime.datetime.now(datetime.timezone.utc)
                 await self._check_price_alerts(symbol, price, previous_price)
-                if self.retracement_zone_service is not None:
-                    await self.retracement_zone_service.check_tick(symbol, price, previous_price)
+                if self.daily_sweep_service is not None:
+                    try:
+                        await self.daily_sweep_service.check_tick(symbol, price, previous_price)
+                    except Exception as error:
+                        logger.error(f"[FinnhubPrice] Daily Sweep tick check failed for {symbol}: {error}")
         elif parsed.get("type") == "error":
             logger.error(f"[FinnhubPrice] API error: {parsed.get('msg')}")
+
+    def get_last_tick(self, symbol: str) -> tuple[float, datetime.datetime] | None:
+        """Latest (price, UTC receive time) for `symbol`, or None if no tick has arrived yet."""
+        at = self.last_price_at.get(symbol)
+        if at is None:
+            return None
+        return self.last_price[symbol], at
 
     async def _check_price_alerts(self, symbol: str, price: float, previous_price: float | None) -> None:
         triggered = await self.price_alert_service.check_tick_against_alerts(symbol, price, previous_price)

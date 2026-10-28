@@ -1,9 +1,10 @@
 import datetime
 import logging
-from typing import Any
+from zoneinfo import ZoneInfo
 
 from telegram.ext import Application, ContextTypes
 
+from app.services.daily_sweep_service import SCAN_RETRY_DELAY_SECONDS, DailySweepService
 from app.services.price_alert_service import PriceAlertService
 from app.services.users_service import UsersService
 from app.telegram_bot import TelegramBotService
@@ -16,7 +17,7 @@ def register_jobs(
     price_alert_service: PriceAlertService,
     telegram_bot: TelegramBotService,
     users_service: UsersService,
-    retracement_zone_service: Any = None,
+    daily_sweep_service: DailySweepService | None = None,
 ) -> None:
     async def run_daily_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("[DailyCleanup] Running daily alert cleanup at 10 PM WAT")
@@ -60,13 +61,48 @@ def register_jobs(
         reset_alert_id_counters, time=datetime.time(hour=23, tzinfo=datetime.timezone.utc), days=FRIDAY
     )
 
-    if retracement_zone_service is not None:
-        async def poll_retracement_zones(context: ContextTypes.DEFAULT_TYPE) -> None:
-            await retracement_zone_service.poll_all_pairs()
+    if daily_sweep_service is not None:
+        async def retry_daily_sweep_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+            pairs: list[str] = context.job.data
+            try:
+                report = await daily_sweep_service.run_scan(pairs)
+            except Exception as error:
+                logger.error(f"[DailySweep] Retry scan failed: {error}")
+                return
+            if report.retry_pairs:
+                logger.warning(f"[DailySweep] Still no usable data after retry for: {', '.join(report.retry_pairs)}")
 
-        # We deliberately poll rather than schedule at a hardcoded 4H boundary: the true
-        # boundary alignment can only be confirmed by inspecting live Twelve Data output
-        # (see RetracementZoneService._log_boundary_alignment / scripts/inspect_4h_candles.py),
-        # and polling detects a new closed candle regardless of that alignment.
-        application.job_queue.run_repeating(poll_retracement_zones, interval=300, first=60)
-        logger.info("[Scheduler] 4H retracement-zone polling job registered (every 5 min)")
+        async def run_daily_sweep_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+            try:
+                report = await daily_sweep_service.run_scan()
+            except Exception as error:
+                logger.error(f"[DailySweep] Scan failed: {error}")
+                return
+            if report.retry_pairs:
+                logger.info(f"[DailySweep] Retrying {len(report.retry_pairs)} pair(s) in 15 minutes")
+                context.job_queue.run_once(
+                    retry_daily_sweep_scan, when=SCAN_RETRY_DELAY_SECONDS, data=report.retry_pairs
+                )
+
+        async def catch_up_daily_sweep_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+            try:
+                if not await daily_sweep_service.needs_catch_up():
+                    return
+            except Exception as error:
+                logger.error(f"[DailySweep] Catch-up check failed: {error}")
+                return
+            logger.info("[DailySweep] Latest closed trading day was never scanned — running catch-up scan")
+            await run_daily_sweep_scan(context)
+
+        # Startup catch-up (bot was down at 17:10): a one-off job so it runs in the background
+        application.job_queue.run_once(catch_up_daily_sweep_scan, when=15)
+
+        # 17:10 New York time — ten minutes after each forex trading day closes at 17:00 NY, so the
+        # final 1H bar has had time to be published. The tzinfo makes APScheduler follow US
+        # daylight saving. Monday-Friday only: days use PTB's 0=Sunday convention (see above).
+        application.job_queue.run_daily(
+            run_daily_sweep_scan,
+            time=datetime.time(hour=17, minute=10, tzinfo=ZoneInfo("America/New_York")),
+            days=(1, 2, 3, 4, 5),
+        )
+        logger.info("[Scheduler] Daily Sweep scan registered (17:10 America/New_York, Mon-Fri)")
