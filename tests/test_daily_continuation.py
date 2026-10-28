@@ -615,7 +615,10 @@ def test_sweepcheck_reports_continuation_classification():
     text = _check_message((100, 110, 90, 105), (105, 112, 100, 118), MON, TUE, now)
     assert "Continuation BUY setup" in text and "① Day 1 high 110.00000" in text and "② Day 2 open 105.00000" in text
     assert "Sweep: no setup" in text
-    assert "Continuation: skipped (gap)" in _check_message((100, 110, 90, 105), (111, 120, 100, 118), MON, TUE, now)
+    # A first 1H bar that opens above Day 1's high used to look like a gap; Day 2's open is now Day 1's
+    # close, so the same bars give an ordinary continuation (the gap rule is covered on direct candles above)
+    gapped = _check_message((100, 110, 90, 105), (111, 120, 100, 118), MON, TUE, now)
+    assert "Continuation BUY setup" in gapped and "skipped (gap)" not in gapped
     assert "Continuation: skipped (took opposite side)" in _check_message(
         (100, 110, 90, 105), (105, 120, 85, 118), MON, TUE, now
     )
