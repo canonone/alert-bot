@@ -1,3 +1,4 @@
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -22,3 +23,14 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # create_all never alters an existing table, so add columns introduced after a deployment's
+        # first run. Additive only and idempotent — nothing is ever dropped at runtime.
+        for statement in (
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_sweep_alerts_enabled BOOLEAN NOT NULL DEFAULT false",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_continuation_alerts_enabled "
+            "BOOLEAN NOT NULL DEFAULT false",
+            "ALTER TABLE daily_sweep_setups ADD COLUMN IF NOT EXISTS kind VARCHAR(16) NOT NULL DEFAULT 'SWEEP'",
+            "ALTER TABLE daily_sweep_setups ADD COLUMN IF NOT EXISTS level2 NUMERIC(18, 6)",
+            "ALTER TABLE daily_sweep_setups ADD COLUMN IF NOT EXISTS stage INTEGER NOT NULL DEFAULT 0",
+        ):
+            await conn.execute(text(statement))
