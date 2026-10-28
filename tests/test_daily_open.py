@@ -30,14 +30,19 @@ REAL = {
 }
 
 
-def _frozen_weekend(price):
-    start = ny(2026, 10, 23, 17)
-    return [{"datetime": start + HOUR * i, "open": price, "high": price, "low": price, "close": price} for i in range(48)]
+def _weekend_bars(price):
+    """Twelve Data keeps quoting through the weekend: live bars drifting ~1 pip an hour from Friday's close."""
+    start, step = ny(2026, 10, 23, 17), price * 0.0001
+    return [
+        {"datetime": start + HOUR * i, "open": price + i * step, "high": price + (i + 2) * step,
+         "low": price + (i - 1) * step, "close": price + (i + 1) * step}
+        for i in range(48)
+    ]
 
 
 def _fri_mon_bars(pair):
     fri, _, bot_mon = REAL[pair]
-    return day_hours(FRI, *fri) + _frozen_weekend(fri[3]) + day_hours(MON, *bot_mon)
+    return day_hours(FRI, *fri) + _weekend_bars(fri[3]) + day_hours(MON, *bot_mon)
 
 
 @pytest.mark.parametrize("pair", list(REAL))
@@ -84,7 +89,7 @@ def test_falls_back_to_the_first_bar_when_the_previous_day_is_unavailable():
 def _eurnzd_three_days():
     fri, _, bot_mon = REAL["EURNZD"]
     tue = (1.96700, 1.96841, 1.95395, 1.95849)  # H/L/C from the bot's logs; first-bar open is irrelevant now
-    bars = day_hours(FRI, *fri) + _frozen_weekend(fri[3]) + day_hours(MON, *bot_mon) + day_hours(TUE, *tue)
+    bars = day_hours(FRI, *fri) + _weekend_bars(fri[3]) + day_hours(MON, *bot_mon) + day_hours(TUE, *tue)
     return aggregate_1h_to_daily(bars, utc(2026, 10, 28, 12))
 
 
