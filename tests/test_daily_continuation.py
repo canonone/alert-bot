@@ -139,9 +139,9 @@ def test_classification_labels_for_real_setups():
 
 def _matches(d1, d2) -> list[str]:
     hits = []
-    if all(ok for _, ok in sm.sweep_checks(d1, d2, SELL)):
+    if all(c.ok for c in sm.sweep_checks(d1, d2, SELL)):
         hits.append("sweep SELL")
-    if all(ok for _, ok in sm.sweep_checks(d1, d2, BUY)):
+    if all(c.ok for c in sm.sweep_checks(d1, d2, BUY)):
         hits.append("sweep BUY")
     result = classify_continuation(d1, d2)
     if result == CONT_BUY:

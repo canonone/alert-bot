@@ -1,9 +1,10 @@
 import asyncio
 import datetime
+import html
 import logging
 import time
 from dataclasses import dataclass, field, replace
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, NamedTuple
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, update
@@ -340,28 +341,52 @@ class ContinuationSignal:
     kind: str = CONTINUATION_KIND
 
 
-def sweep_checks(day1: DailyCandle, day2: DailyCandle, direction: str) -> list[tuple[str, bool]]:
-    """Every strict condition for `direction`, labelled — used by detect_sweep and /sweepcheck."""
+class Check(NamedTuple):
+    """One strict condition: what the pattern needs, whether it held, and what actually happened."""
+
+    needs: str
+    ok: bool
+    but: str  # the actual numbers, e.g. "Day 2 high 1.96841 < Day 1 high 1.97157"
+
+    def failure_text(self) -> str:
+        return f"✗ needs {self.needs} — but {self.but}"
+
+
+def _compare(pair: str, a_label: str, a: float, b_label: str, b: float) -> str:
+    # The real relation (not the negation of the requirement), so equal values read as "=", not "≤"
+    relation = ">" if a > b else "<" if a < b else "="
+    return f"{a_label} {format_price(pair, a)} {relation} {b_label} {format_price(pair, b)}"
+
+
+def sweep_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pair: str = "") -> list[Check]:
+    """Every strict condition for `direction` — used by detect_sweep, the scan log and /sweepcheck."""
+    def close_vs_open(day: str, c: DailyCandle) -> str:
+        return _compare(pair, f"{day} close", c.close, "open", c.open)
+
     if direction == SELL:
         return [
-            ("Day 1 closed bullish (close > open)", day1.close > day1.open),
-            ("Day 2 closed bearish (close < open)", day2.close < day2.open),
-            ("Day 2 swept Day 1's high (high > Day 1 high)", day2.high > day1.high),
-            ("Day 2 did not sweep Day 1's low (low > Day 1 low)", day2.low > day1.low),
+            Check("Day 1 to close bullish", day1.close > day1.open, close_vs_open("Day 1", day1)),
+            Check("Day 2 to close bearish", day2.close < day2.open, close_vs_open("Day 2", day2)),
+            Check("Day 2 to sweep Day 1's high", day2.high > day1.high,
+                  _compare(pair, "Day 2 high", day2.high, "Day 1 high", day1.high)),
+            Check("Day 2 to stay above Day 1's low", day2.low > day1.low,
+                  _compare(pair, "Day 2 low", day2.low, "Day 1 low", day1.low)),
         ]
     return [
-        ("Day 1 closed bearish (close < open)", day1.close < day1.open),
-        ("Day 2 closed bullish (close > open)", day2.close > day2.open),
-        ("Day 2 swept Day 1's low (low < Day 1 low)", day2.low < day1.low),
-        ("Day 2 did not sweep Day 1's high (high < Day 1 high)", day2.high < day1.high),
+        Check("Day 1 to close bearish", day1.close < day1.open, close_vs_open("Day 1", day1)),
+        Check("Day 2 to close bullish", day2.close > day2.open, close_vs_open("Day 2", day2)),
+        Check("Day 2 to sweep Day 1's low", day2.low < day1.low,
+              _compare(pair, "Day 2 low", day2.low, "Day 1 low", day1.low)),
+        Check("Day 2 to stay below Day 1's high", day2.high < day1.high,
+              _compare(pair, "Day 2 high", day2.high, "Day 1 high", day1.high)),
     ]
 
 
 def detect_sweep(day1: DailyCandle, day2: DailyCandle) -> SweepSignal | None:
     """Both candles must already be fully closed — the caller guarantees it."""
-    if all(ok for _, ok in sweep_checks(day1, day2, SELL)):
+    if all(c.ok for c in sweep_checks(day1, day2, SELL)):
         return SweepSignal(SELL, day2.open, day2.high)
-    if all(ok for _, ok in sweep_checks(day1, day2, BUY)):
+    if all(c.ok for c in sweep_checks(day1, day2, BUY)):
         return SweepSignal(BUY, day2.open, day2.low)
     return None
 
@@ -374,37 +399,46 @@ SKIP_OPPOSITE = "skipped (took opposite side)"
 NO_CONTINUATION = "none"
 
 
-def continuation_checks(day1: DailyCandle, day2: DailyCandle, direction: str) -> list[tuple[str, bool]]:
-    """Every strict condition for a continuation, labelled. The first three are the pattern itself;
-    the last two are the exclusions (took the opposite side / gapped past Day 1's extreme).
+def continuation_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pair: str = "") -> list[Check]:
+    """Every strict condition for a continuation. The first three are the pattern itself; the last
+    two are the exclusions (took the opposite side / gapped past Day 1's extreme).
 
     The gap exclusion can effectively never fire on candles built by aggregate_1h_to_daily: Day 2's
     open is Day 1's close, which can't be at or beyond Day 1's high/low unless Day 1 closed exactly
     on it. It stays as a harmless guard (and for candles whose open fell back to the first bar)."""
+    def close_vs_open(day: str, c: DailyCandle) -> str:
+        return _compare(pair, f"{day} close", c.close, "open", c.open)
+
     if direction == BUY:
         return [
-            ("Day 1 closed bullish (close > open)", day1.close > day1.open),
-            ("Day 2 closed bullish (close > open)", day2.close > day2.open),
-            ("Day 2 closed above Day 1's high (close > Day 1 high)", day2.close > day1.high),
-            ("Day 2 did not take Day 1's low (low > Day 1 low)", day2.low > day1.low),
-            ("Day 2 did not gap above Day 1's high (open < Day 1 high)", day2.open < day1.high),
+            Check("Day 1 to close bullish", day1.close > day1.open, close_vs_open("Day 1", day1)),
+            Check("Day 2 to close bullish", day2.close > day2.open, close_vs_open("Day 2", day2)),
+            Check("Day 2 to close above Day 1's high", day2.close > day1.high,
+                  _compare(pair, "Day 2 close", day2.close, "Day 1 high", day1.high)),
+            Check("Day 2 to stay above Day 1's low", day2.low > day1.low,
+                  _compare(pair, "Day 2 low", day2.low, "Day 1 low", day1.low)),
+            Check("Day 2 to open below Day 1's high (no gap)", day2.open < day1.high,
+                  _compare(pair, "Day 2 open", day2.open, "Day 1 high", day1.high)),
         ]
     return [
-        ("Day 1 closed bearish (close < open)", day1.close < day1.open),
-        ("Day 2 closed bearish (close < open)", day2.close < day2.open),
-        ("Day 2 closed below Day 1's low (close < Day 1 low)", day2.close < day1.low),
-        ("Day 2 did not take Day 1's high (high < Day 1 high)", day2.high < day1.high),
-        ("Day 2 did not gap below Day 1's low (open > Day 1 low)", day2.open > day1.low),
+        Check("Day 1 to close bearish", day1.close < day1.open, close_vs_open("Day 1", day1)),
+        Check("Day 2 to close bearish", day2.close < day2.open, close_vs_open("Day 2", day2)),
+        Check("Day 2 to close below Day 1's low", day2.close < day1.low,
+              _compare(pair, "Day 2 close", day2.close, "Day 1 low", day1.low)),
+        Check("Day 2 to stay below Day 1's high", day2.high < day1.high,
+              _compare(pair, "Day 2 high", day2.high, "Day 1 high", day1.high)),
+        Check("Day 2 to open above Day 1's low (no gap)", day2.open > day1.low,
+              _compare(pair, "Day 2 open", day2.open, "Day 1 low", day1.low)),
     ]
 
 
 def classify_continuation(day1: DailyCandle, day2: DailyCandle) -> str:
     for direction, label in ((BUY, CONT_BUY), (SELL, CONT_SELL)):
         checks = continuation_checks(day1, day2, direction)
-        if all(ok for _, ok in checks[:3]):
-            if not checks[3][1]:
+        if all(c.ok for c in checks[:3]):
+            if not checks[3].ok:
                 return SKIP_OPPOSITE
-            if not checks[4][1]:
+            if not checks[4].ok:
                 return SKIP_GAP
             return label
     return NO_CONTINUATION
@@ -438,16 +472,38 @@ def should_catch_up(last_scanned_day: datetime.date | None, now_utc: datetime.da
     return not is_expired(day3_expiry(expected_day), now_utc)
 
 
-def explain_no_setup(day1: DailyCandle, day2: DailyCandle) -> str:
-    """Why detect_sweep returned None, judged against the direction Day 1's colour points to."""
-    if day1.close > day1.open:
-        direction = SELL
-    elif day1.close < day1.open:
-        direction = BUY
-    else:
-        return "Day 1 closed flat (close == open)"
-    failed = [label for label, ok in sweep_checks(day1, day2, direction) if not ok]
-    return f"{direction} checks failed: " + "; ".join(failed)
+def _failed_lines(day1: DailyCandle, day2: DailyCandle, pair: str, checks_for) -> list[str]:
+    """Failed checks for the direction Day 1's colour points to (bullish -> SELL sweep / BUY continuation,
+    bearish -> the other way), each as "✗ needs X — but Y" with the actual numbers."""
+    if day1.close == day1.open:
+        return [f"Day 1 closed flat ({_compare(pair, 'close', day1.close, 'open', day1.open)}) — neither direction applies"]
+    bullish = day1.close > day1.open
+    direction, label = checks_for(bullish)
+    failed = [c.failure_text() for c in direction if not c.ok]
+    return [label] + failed
+
+
+def explain_no_setup(day1: DailyCandle, day2: DailyCandle, pair: str = "") -> list[str]:
+    """Why detect_sweep returned None: a heading plus one "✗ needs X — but Y" line per failed check,
+    judged against the direction Day 1's colour points to."""
+    return _failed_lines(
+        day1, day2, pair,
+        lambda bullish: (
+            sweep_checks(day1, day2, SELL if bullish else BUY, pair),
+            f"{'SELL' if bullish else 'BUY'} sweep (Day 1 closed {'bullish' if bullish else 'bearish'}):",
+        ),
+    )
+
+
+def explain_no_continuation(day1: DailyCandle, day2: DailyCandle, pair: str = "") -> list[str]:
+    """Same for continuations: bullish Day 1 -> BUY continuation, bearish -> SELL continuation."""
+    return _failed_lines(
+        day1, day2, pair,
+        lambda bullish: (
+            continuation_checks(day1, day2, BUY if bullish else SELL, pair),
+            f"{'BUY' if bullish else 'SELL'} continuation (Day 1 closed {'bullish' if bullish else 'bearish'}):",
+        ),
+    )
 
 
 # ── Pure: message formatting ────────────────────────────────────────────────
@@ -934,8 +990,10 @@ class DailySweepService:
         signal: SweepSignal | ContinuationSignal | None = detect_sweep(day1, day2) or detect_continuation(day1, day2)
         if signal is None:
             logger.info(
-                f"[DailySweep] {pair} no setup — sweep: {explain_no_setup(day1, day2)}; "
-                f"continuation: {classify_continuation(day1, day2)}"
+                f"[DailySweep] {pair} no setup — "
+                + " ".join(explain_no_setup(day1, day2, pair))
+                + f" | continuation: {classify_continuation(day1, day2)} "
+                + " ".join(explain_no_continuation(day1, day2, pair))
             )
             return PairScan(pair, "none")
 
@@ -1177,7 +1235,10 @@ class DailySweepService:
             else:
                 signal = detect_sweep(day1, day2)
                 if signal is None:
-                    lines.append(f"🔁 Sweep: no setup — {explain_no_setup(day1, day2)}")
+                    head, *failed = explain_no_setup(day1, day2, pair)
+                    # < and > in the numbers must be escaped: this message is sent as Telegram HTML
+                    lines.append(f"🔁 Sweep: no setup — {html.escape(head)}")
+                    lines.extend(f"   {html.escape(line)}" for line in failed)
                 else:
                     emoji = "🔻" if signal.direction == SELL else "🔺"
                     lines.append(
@@ -1187,7 +1248,9 @@ class DailySweepService:
                     )
                 continuation = detect_continuation(day1, day2)
                 if continuation is None:
-                    lines.append(f"📈 Continuation: {classify_continuation(day1, day2)}")
+                    head, *failed = explain_no_continuation(day1, day2, pair)
+                    lines.append(f"📈 Continuation: {classify_continuation(day1, day2)} — {html.escape(head)}")
+                    lines.extend(f"   {html.escape(line)}" for line in failed)
                 else:
                     emoji = "🔻" if continuation.direction == SELL else "🔺"
                     side = "high" if continuation.direction == BUY else "low"
