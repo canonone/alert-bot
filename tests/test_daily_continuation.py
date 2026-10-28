@@ -52,7 +52,7 @@ TUE_C = (110.515, 111.085, 110.362, 110.966)
 
 def _state(day1_ohlc, day2_ohlc, day1_date, day2_date, stage=0, setup_id=1, pair=PAIR) -> SetupState:
     d1, d2 = candle(day1_date, *day1_ohlc), candle(day2_date, *day2_ohlc)
-    signal = detect_continuation(d1, d2)
+    signal = detect_continuation(d1, d2, pair)
     assert signal is not None
     return SetupState(
         id=setup_id, pair=pair, direction=signal.direction,
