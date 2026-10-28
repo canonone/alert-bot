@@ -180,16 +180,18 @@ def test_four_patterns_are_mutually_exclusive_random_floats():
 
 # ── A. Weekend case: Fri -> Mon BUY continuation, built from 1H bars ────────
 
-def _weekend_frozen_bars():
+def _weekend_bars():
+    """Live weekend quotes (Twelve Data keeps quoting), drifting ~1 pip an hour; dropped by time."""
     start = ny(2026, 10, 23, 17)  # Friday close -> Sunday reopen
     return [
-        {"datetime": start + HOUR * i, "open": 110.349, "high": 110.3491, "low": 110.3489, "close": 110.349}
+        {"datetime": start + HOUR * i, "open": 110.349 + 0.011 * i, "high": 110.349 + 0.011 * (i + 2),
+         "low": 110.349 + 0.011 * (i - 1), "close": 110.349 + 0.011 * (i + 1)}
         for i in range(48)
     ]
 
 
 def test_A_weekend_buy_continuation_ticks_and_silent_expiry(monkeypatch):
-    bars = day_hours(FRI, *FRI_C) + _weekend_frozen_bars() + day_hours(MON, *MON_C)
+    bars = day_hours(FRI, *FRI_C) + _weekend_bars() + day_hours(MON, *MON_C)
     now = ny(2026, 10, 26, 17, 10)
     db = {"status": "ACTIVE", "stage": 0}
     svc, sent = _new_service(monkeypatch, db)
@@ -615,7 +617,10 @@ def test_sweepcheck_reports_continuation_classification():
     text = _check_message((100, 110, 90, 105), (105, 112, 100, 118), MON, TUE, now)
     assert "Continuation BUY setup" in text and "① Day 1 high 110.00000" in text and "② Day 2 open 105.00000" in text
     assert "Sweep: no setup" in text
-    assert "Continuation: skipped (gap)" in _check_message((100, 110, 90, 105), (111, 120, 100, 118), MON, TUE, now)
+    # A first 1H bar that opens above Day 1's high used to look like a gap; Day 2's open is now Day 1's
+    # close, so the same bars give an ordinary continuation (the gap rule is covered on direct candles above)
+    gapped = _check_message((100, 110, 90, 105), (111, 120, 100, 118), MON, TUE, now)
+    assert "Continuation BUY setup" in gapped and "skipped (gap)" not in gapped
     assert "Continuation: skipped (took opposite side)" in _check_message(
         (100, 110, 90, 105), (105, 120, 85, 118), MON, TUE, now
     )

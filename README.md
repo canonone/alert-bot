@@ -112,7 +112,8 @@ per scan and checked for both patterns. Opt in with `/contalerts on` (independen
 `/sweepalerts`). Day 2 must be fully closed; all comparisons are strict.
 
 - **BUY** — Day 1 and Day 2 both close bullish, Day 2 closes above Day 1's high, Day 2's low >
-  Day 1's low (it didn't take the low), and Day 2 opened below Day 1's high (no gap).
+  Day 1's low (it didn't take the low), and Day 2 opened below Day 1's high (no gap — see the note
+  below: with open = previous close this can effectively never trigger, but the rule is kept).
   Level 1 = Day 1's high, Level 2 = Day 2's open (always below Level 1).
 - **SELL** — the mirror: both bearish, Day 2 closes below Day 1's low, Day 2's high < Day 1's
   high, Day 2 opened above Day 1's low. Level 1 = Day 1's low, Level 2 = Day 2's open.
@@ -123,11 +124,22 @@ atomic database update, so it can never be sent twice. At Day 3's close the setu
 whether nothing or only Level 1 was hit. The suggested stop is Day 2's low (BUY) / high (SELL).
 A Day 2 can match only one of the four patterns (the Day 1/Day 2 colour combination decides it).
 
+Because a day's open is the previous day's close, Day 2 always opens at Day 1's close, so a gap
+between Day 1 and Day 2 can no longer occur and the "no gap" skip effectively never fires (only if
+Day 1 closed exactly on its own high/low, or when an open fell back to the first bar). The code is
+kept as a harmless guard. `/sweepcheck` shows `open = previous close` per candle, and both values
+when the first 1H bar's open differs by more than 2 pips.
+
 **Daily candles.** A trading day runs 17:00 → 17:00 `America/New_York` (matching FOREX.com on
 TradingView), built by aggregating Twelve Data 1H bars — Twelve Data's own `1day` candles use
 midnight UTC and don't match. US daylight saving is handled by `zoneinfo` (hence the `tzdata`
-requirement). Sunday evening's session belongs to Monday; weekend/frozen bars are discarded, so
-the day before Monday is Friday. A day is only used if its final bar (16:00–17:00 NY) is present and it has at least 22 bars
+requirement). A day's **open is the previous trading day's close** (as on FOREX.com, where Monday opens
+exactly at Friday's close); a 1H feed's first bar can open well away from that, Monday most of all.
+High, low and close come from the 1H bars. If the previous day is missing or incomplete (or is the
+oldest day in the fetched data) the open falls back to the first 1H bar's open, and the scan logs it.
+Sunday evening's session belongs to Monday. Twelve Data keeps quoting through the weekend (those
+bars have real ranges and the price can drift well away from Friday's close), so the bars between
+Friday 17:00 and Sunday 17:00 New York time are dropped by time alone; the day before Monday is Friday. A day is only used if its final bar (16:00–17:00 NY) is present and it has at least 22 bars
 (`PAIR_MIN_DAILY_BARS` overrides per pair — gold has a daily 17:00–18:00 break) and its range isn't
 degenerate; Day 1 and Day 2 must be consecutive trading days.
 
@@ -137,7 +149,8 @@ Pairs whose latest day hasn't appeared yet (or that hit a quota error) are retri
 minutes later. Each pair's computed Day 1 / Day 2 OHLC is logged on every scan. New setups are
 sent as one digest; live Finnhub ticks then trigger level-hit alerts. Setups are stored in
 `daily_sweep_setups`, so they survive restarts. If the latest closed trading day hasn't been scanned when the bot starts
-(e.g. it was down at 17:10) and its Day 3 is still running, a catch-up scan runs in the background.
+(e.g. it was down at 17:10) and its Day 3 is still running, a catch-up scan runs in the background. Each scan fetches 168 1H bars per pair (Day 1's open needs
+the close of the day before it).
 If the current price (latest Finnhub tick if under 2 minutes old, else Twelve Data) is already at/through a new setup's level, the alert fires immediately
 with a note that the level was reached before the setup was armed.
 
@@ -145,6 +158,10 @@ with a note that the level was reached before the setup was armed.
 chart from FOREX.com. These are three different feeds, so levels can differ by a few pips or
 cents from what you see on TradingView. Use `/sweepcheck PAIR` (or the scan logs) to compare the
 bot's candles against your chart.
+
+In particular, Friday's close can differ from FOREX.com's by a few pips on some pairs (for example
+EURNZD on 23 Oct 2026: 8.7 pips), and because a day's open is the previous close, Monday's open
+inherits that difference. High, low and close can also be a few pips off (typically 0.2–3 pips).
 
 ---
 

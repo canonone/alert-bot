@@ -203,10 +203,11 @@ def test_friday_to_monday_with_sunday_session_folded_into_monday():
     mon = D(2026, 10, 26)
     friday = day_hours(fri, 100, 110, 90, 105)
     monday = day_hours(mon, 105, 112, 95, 100)  # starts Sun 17:00 NY
-    # Frozen weekend bars: Fri 17:00 NY -> Sun 17:00 NY, same price with float jitter
+    # Weekend bars, Fri 17:00 NY -> Sun 17:00 NY: Twelve Data keeps quoting, price drifting away from 105
     weekend_start = ny(2026, 10, 23, 17)
     frozen = [
-        {"datetime": weekend_start + HOUR * i, "open": 105.0, "high": 105.0001, "low": 104.9999, "close": 105.0}
+        {"datetime": weekend_start + HOUR * i, "open": 105.0 + 0.05 * i, "high": 105.0 + 0.05 * (i + 2),
+         "low": 105.0 + 0.05 * (i - 1), "close": 105.0 + 0.05 * (i + 1)}
         for i in range(48)
     ]
     now = utc(2026, 10, 26, 22)
@@ -215,7 +216,7 @@ def test_friday_to_monday_with_sunday_session_folded_into_monday():
     assert [d.date for d in daily] == [fri, mon]  # no Saturday/Sunday candles
     assert daily[1].start_utc == ny(2026, 10, 25, 17)  # Monday's candle opens Sunday evening
     assert daily[1].open == 105  # first Sunday-session bar's open
-    assert daily[0].close == 105  # Friday untouched by the frozen bars
+    assert daily[0].close == 105  # Friday untouched by the (live, drifting) weekend bars
 
     usable = usable_daily_candles(daily, "EURUSD")
     pair = last_two_days(usable)

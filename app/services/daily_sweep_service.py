@@ -2,7 +2,7 @@ import asyncio
 import datetime
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
 
@@ -38,8 +38,10 @@ UTC = datetime.timezone.utc
 DAY_ROLL_HOUR_NY = 17
 
 ONE_H_INTERVAL = "1h"
-# Day 1 + Day 2 even across a weekend (Fri, Sat/Sun frozen bars, Sunday session, Mon) is ~96 bars
-ONE_H_LOOKBACK = 120
+# Day 1 + Day 2 plus the day before Day 1 (its close is Day 1's open), even across a weekend with
+# Twelve Data's Sat/Sun bars (it keeps quoting through the weekend): Fri, 48 weekend bars, Mon, Tue
+# ~ 120+, so leave headroom
+ONE_H_LOOKBACK = 168
 
 # Twelve Data's free tier allows 8 requests/minute — one request per pair, spaced 8s apart
 SCAN_REQUEST_SPACING_SECONDS = 8.0
@@ -59,9 +61,10 @@ SCAN_HOUR_NY = 17
 SCAN_MINUTE_NY = 10
 
 # Forex/gold markets close for the weekend: Friday 17:00 through Sunday 17:00 New York time.
-# During this window Twelve Data keeps returning "complete" 1H candles for a closed market —
-# same last-traded price repeated with tiny float jitter. (The old 4H feature used a fixed UTC
-# window; New York time is used here so the window follows the daylight-saving shift.)
+# Twelve Data keeps quoting through this window — the 1H bars have real ranges and the price can
+# drift tens of pips away from Friday's close — so they are dropped purely by time, not by looking
+# at the prices. (The old 4H feature used a fixed UTC window; New York time is used here so the
+# window follows the daylight-saving shift.)
 # Weekday numbers follow datetime.weekday(): Monday=0 ... Sunday=6.
 MARKET_CLOSE_WEEKDAY_NY = 4  # Friday
 MARKET_REOPEN_WEEKDAY_NY = 6  # Sunday
@@ -97,6 +100,18 @@ def price_decimals(pair: str) -> int:
 
 def format_price(pair: str, value: float) -> str:
     return f"{value:,.{price_decimals(pair)}f}"
+
+
+def pip_size(pair: str) -> float:
+    if pair.endswith("JPY"):
+        return 0.01
+    if pair == "XAUUSD":
+        return 0.1
+    return 0.0001
+
+
+# How far the first 1H bar's open may sit from the previous close before /sweepcheck shows both
+OPEN_DIFF_NOTE_PIPS = 2
 
 
 def min_daily_bars_for(pair: str) -> int:
@@ -194,6 +209,10 @@ class DailyCandle:
     bar_count: int = 24
     has_final_bar: bool = True
     min_bars: int = DEFAULT_MIN_DAILY_BARS
+    # The first 1H bar's open (None = same as `open`). `open` itself is the previous trading day's
+    # close whenever that day is available — see aggregate_1h_to_daily.
+    first_bar_open: float | None = None
+    open_from_prev_close: bool = False
 
     @property
     def is_complete(self) -> bool:
@@ -221,6 +240,12 @@ def aggregate_1h_to_daily(
     haven't closed yet. Days short on bars are still returned (`is_complete` False, `missing_hours`
     listing every absent hour) so callers can diagnose them — use `usable_daily_candles` to keep
     only complete days.
+
+    OPEN: FOREX.com's daily open is exactly the previous day's close (Monday's too: the weekend
+    reopen print is not used), but a 1H feed's first bar of a day can open away from it (Monday
+    most of all). So each day's open is set to the previous trading day's close when that day is
+    present and complete; otherwise it falls back to the first 1H bar's open
+    (`open_from_prev_close` False — callers log that). High, low and close always come from the bars.
     """
     one_hour = datetime.timedelta(hours=1)
     buckets: dict[datetime.date, list[dict]] = {}
@@ -264,9 +289,18 @@ def aggregate_1h_to_daily(
                 bar_count=len(present),
                 has_final_bar=(day_end - one_hour) in present,
                 min_bars=min_bars,
+                first_bar_open=members[0]["open"],
             )
         )
-    return daily
+
+    by_date = {d.date: d for d in daily}
+    result: list[DailyCandle] = []
+    for day in daily:
+        previous = by_date.get(previous_trading_day(day.date))
+        if previous is not None and previous.is_complete:
+            day = replace(day, open=previous.close, open_from_prev_close=True)
+        result.append(day)
+    return result
 
 
 def usable_daily_candles(daily: list[DailyCandle], pair: str) -> list[DailyCandle]:
@@ -342,7 +376,11 @@ NO_CONTINUATION = "none"
 
 def continuation_checks(day1: DailyCandle, day2: DailyCandle, direction: str) -> list[tuple[str, bool]]:
     """Every strict condition for a continuation, labelled. The first three are the pattern itself;
-    the last two are the exclusions (took the opposite side / gapped past Day 1's extreme)."""
+    the last two are the exclusions (took the opposite side / gapped past Day 1's extreme).
+
+    The gap exclusion can effectively never fire on candles built by aggregate_1h_to_daily: Day 2's
+    open is Day 1's close, which can't be at or beyond Day 1's high/low unless Day 1 closed exactly
+    on it. It stays as a harmless guard (and for candles whose open fell back to the first bar)."""
     if direction == BUY:
         return [
             ("Day 1 closed bullish (close > open)", day1.close > day1.open),
@@ -597,6 +635,21 @@ def format_continuation_hit(
     )
 
 
+def open_note(pair: str, candle: DailyCandle) -> str:
+    """How the candle's open was decided; shows the first 1H bar's open too when it's far off."""
+    if not candle.open_from_prev_close:
+        return "⚠️ open = first 1H bar (previous trading day not available)"
+    first = candle.first_bar_open
+    if first is not None:
+        pips = abs(first - candle.open) / pip_size(pair)
+        if pips > OPEN_DIFF_NOTE_PIPS:
+            return (
+                f"open = previous close ({format_price(pair, candle.open)}); "
+                f"first 1H bar opened {format_price(pair, first)} ({pips:.1f} pips apart)"
+            )
+    return "open = previous close"
+
+
 def format_candle_line(pair: str, label: str, candle: DailyCandle) -> str:
     if not candle.is_complete:
         warning = f" ⚠️ incomplete — {candle.incomplete_reason}"
@@ -607,7 +660,8 @@ def format_candle_line(pair: str, label: str, candle: DailyCandle) -> str:
     return (
         f"<b>{label} — {candle.date:%a %Y-%m-%d}</b>{warning}\n"
         f"   {_wat_str(candle.start_utc)} → {_wat_str(candle.end_utc)}\n"
-        f"   {_ohlc_str(pair, (candle.open, candle.high, candle.low, candle.close))}"
+        f"   {_ohlc_str(pair, (candle.open, candle.high, candle.low, candle.close))}\n"
+        f"   {open_note(pair, candle)}"
     )
 
 
@@ -853,8 +907,14 @@ class DailySweepService:
             logger.info(
                 f"[DailySweep] {pair} {label} {candle.date} "
                 f"({_wat_str(candle.start_utc)} → {_wat_str(candle.end_utc)}) "
-                f"O:{candle.open} H:{candle.high} L:{candle.low} C:{candle.close}"
+                f"O:{candle.open} H:{candle.high} L:{candle.low} C:{candle.close} "
+                f"[{open_note(pair, candle)}]"
             )
+            if not candle.open_from_prev_close:
+                logger.warning(
+                    f"[DailySweep] {pair} {label} {candle.date}: previous trading day unavailable — "
+                    f"using the first 1H bar's open {candle.open}"
+                )
 
         if not usable or usable[-1].date != expected_day:
             latest = usable[-1].date if usable else None
