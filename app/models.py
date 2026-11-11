@@ -42,11 +42,8 @@ class User(Base):
 
     alert_id_counter: Mapped[int] = mapped_column(Integer, default=0)
 
-    # Opt-in flags for Daily Sweep / Daily Continuation notifications (see DailySweepService)
+    # Opt-in flag for Daily Sweep notifications (see DailySweepService)
     daily_sweep_alerts_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
-    daily_continuation_alerts_enabled: Mapped[bool] = mapped_column(
-        Boolean, default=False, server_default="false"
-    )
 
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime.datetime] = mapped_column(
@@ -89,8 +86,6 @@ class DailySweepSetup(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
     pair: Mapped[str] = mapped_column(String, index=True)
-    # "SWEEP" | "CONTINUATION" — both patterns live in this table (a Day 2 can only match one)
-    kind: Mapped[str] = mapped_column(String(16), default="SWEEP", server_default="SWEEP")
     direction: Mapped[str] = mapped_column(String(10))  # "SELL" | "BUY"
 
     day1_open: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
@@ -103,20 +98,15 @@ class DailySweepSetup(Base):
     day2_low: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
     day2_close: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
 
-    # SWEEP: Day 2's open — the price Day 3 must retrace to.
-    # CONTINUATION: Level 1, the broken Day 1 high (BUY) / low (SELL).
+    # Day 2's open — the price Day 3 must retrace to
     level: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
-    # CONTINUATION only: Level 2, Day 2's open (always beyond Level 1, hit second)
-    level2: Mapped[float | None] = mapped_column(Numeric(18, 6, asdecimal=False), nullable=True)
-    # Alerts already sent: SWEEP 0 -> 1 (done); CONTINUATION 0 -> 1 (Level 1 hit) -> 2 (done)
-    stage: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     # Trading day (labelled by the New York date it closes on) of the Day 2 candle
     day2_date: Mapped[datetime.date] = mapped_column(Date)
     # Close of Day 3 (UTC) — the setup is cancelled if the level isn't reached by then
     day3_expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
 
-    # ACTIVE | TRIGGERED (all stages sent) | EXPIRED
+    # ACTIVE | TRIGGERED | EXPIRED
     status: Mapped[str] = mapped_column(String(10), index=True, default="ACTIVE")
     triggered_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     trigger_price: Mapped[float | None] = mapped_column(Numeric(18, 6, asdecimal=False), nullable=True)

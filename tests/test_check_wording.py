@@ -53,24 +53,6 @@ def test_buy_sweep_wording():
     ]
 
 
-def test_continuation_failures_use_the_actual_numbers():
-    d1, d2 = candle(MON, *MON_C), candle(TUE, *TUE_C)
-    heading, *failed = sm.explain_no_continuation(d1, d2, "EURNZD")
-    assert heading == "BUY continuation (Day 1 closed bullish):"
-    assert failed == [
-        "✗ needs Day 2 to close bullish — but Day 2 close 1.95849 < open 1.96693",
-        "✗ needs Day 2 to close ≥3 pips above Day 1's high — but it closed 130.8 pips below (1.95849 vs 1.97157)",
-        "✗ needs Day 2 to stay ≥2 pips above Day 1's low — but it went 104.6 pips beyond (1.95395 vs 1.96441)",
-    ]  # the no-gap check passed (open 1.96693 < Day 1 high 1.97157), so it isn't listed
-
-
-def test_continuation_sell_and_gap_wording():
-    d1, d2 = candle(MON, 105, 110, 90, 95), candle(TUE, 89, 100, 80, 82)  # opened below Day 1's low
-    assert _failed(sm.continuation_checks(d1, d2, SELL, "EURUSD")) == [
-        "✗ needs Day 2 to open above Day 1's low (no gap) — but Day 2 open 89.00000 < Day 1 low 90.00000"
-    ]
-
-
 def test_prices_use_the_pairs_precision():
     d1, d2 = candle(MON, 110.0, 110.5, 109.5, 110.4), candle(TUE, 110.4, 110.45, 110.0, 110.1)
     jpy = _failed(sm.sweep_checks(d1, d2, SELL, "AUDJPY"))
@@ -87,8 +69,7 @@ def test_flat_day1_has_no_direction():
 def test_every_failed_check_lists_what_the_pattern_needs():
     # None of the check texts may state a requirement as a fact: every failure line starts "✗ needs" and has "— but"
     d1, d2 = candle(MON, *MON_C), candle(TUE, *TUE_C)
-    for checks in (sm.sweep_checks(d1, d2, SELL), sm.sweep_checks(d1, d2, BUY),
-                   sm.continuation_checks(d1, d2, BUY), sm.continuation_checks(d1, d2, SELL)):
+    for checks in (sm.sweep_checks(d1, d2, SELL), sm.sweep_checks(d1, d2, BUY)):
         for line in _failed(checks):
             assert re.fullmatch(r"✗ needs .+ — but .+", line)
 
@@ -104,7 +85,6 @@ def test_sweepcheck_message_wording_and_is_valid_telegram_html():
     assert "🔁 Sweep: no setup — SELL sweep (Day 1 closed bullish):" in text
     assert "✗ needs Day 2 to sweep Day 1&#x27;s high by ≥3 pips — but its high stayed 31.6 pips below Day 1&#x27;s high (1.96841 vs 1.97157)" in text
     assert "✗ needs Day 2 to stay ≥2 pips above Day 1&#x27;s low — but it went 104.6 pips beyond (1.95395 vs 1.96441)" in text
-    assert "📈 Continuation: none — BUY continuation (Day 1 closed bullish):" in text
     # Telegram HTML: a raw < or > anywhere but in the <b> tags we use makes the whole message fail to send
     assert "<" not in re.sub(r"</?b>", "", text) and ">" not in re.sub(r"</?b>", "", text)
 
@@ -116,4 +96,3 @@ def test_scan_log_uses_the_same_wording(caplog):
     with caplog.at_level(logging.INFO):
         asyncio.run(svc._scan_pair("EURNZD", TUE))
     assert "no setup — SELL sweep (Day 1 closed bullish): ✗ needs Day 2 to sweep Day 1's high by ≥3 pips — but its high stayed 31.6 pips below Day 1's high (1.96841 vs 1.97157)" in caplog.text
-    assert "continuation: none BUY continuation (Day 1 closed bullish): ✗ needs Day 2 to close bullish" in caplog.text

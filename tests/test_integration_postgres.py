@@ -28,8 +28,8 @@ from app.services.daily_sweep_service import (
     TRIGGERED,
     DailySweepService,
     day3_expiry,
-    detect_continuation,
     detect_sweep,
+    previous_trading_day,
 )
 from app.services.users_service import UsersService
 
@@ -38,9 +38,7 @@ from test_daily_sweep import D, candle, utc
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
 pytestmark = pytest.mark.skipif(not TEST_DATABASE_URL, reason="TEST_DATABASE_URL not set")
 
-MON_C = (110.349, 110.762, 110.089, 110.515)
-TUE_C = (110.515, 111.085, 110.362, 110.966)
-MID_DAY3 = utc(2026, 10, 28, 8)  # Wed 08:00 UTC: inside the continuation's Day 3 (Day 2 = Tue 27 Oct)
+MID_DAY3 = utc(2026, 10, 28, 8)  # Wed 08:00 UTC
 
 
 @contextlib.asynccontextmanager
@@ -80,16 +78,11 @@ def _service():
     return svc, users, sent
 
 
-def _sweep_args():
-    d1, d2 = candle(D(2026, 10, 27), 100, 110, 90, 105), candle(D(2026, 10, 28), 105, 112, 95, 100)
-    signal = detect_sweep(d1, d2)
-    return "EURUSD", signal, d1, d2, day3_expiry(d2.date)
-
-
-def _cont_args(pair="AUDJPY"):
-    d1, d2 = candle(D(2026, 10, 26), *MON_C), candle(D(2026, 10, 27), *TUE_C)
-    signal = detect_continuation(d1, d2)
-    return pair, signal, d1, d2, day3_expiry(d2.date)
+def _sweep_args(pair="EURUSD", day2=D(2026, 10, 28)):
+    """A SELL sweep (Day 1 bullish, Day 2 bearish sweeping the high) whose Day 2 is `day2`."""
+    d1 = candle(previous_trading_day(day2), 100, 110, 90, 105)
+    d2 = candle(day2, 105, 112, 95, 100)
+    return pair, detect_sweep(d1, d2), d1, d2, day3_expiry(day2)
 
 
 async def _row(Session, setup_id) -> DailySweepSetup:
@@ -108,12 +101,13 @@ def test_init_db_idempotent_on_empty_and_old_schema():
         async with pg() as (engine, Session):
             await db_module.init_db()  # already ran once in pg(); this is run #2 on an empty database
             async with engine.connect() as conn:
-                cols = {r[0] for r in await conn.execute(text(
-                    "select column_name from information_schema.columns where table_schema = current_schema() "
-                    "and table_name in ('users','daily_sweep_setups')"))}
-            assert {"daily_sweep_alerts_enabled", "daily_continuation_alerts_enabled", "kind", "level2", "stage"} <= cols
+                for table, model in (("users", User), ("daily_sweep_setups", DailySweepSetup)):
+                    cols = {r[0] for r in await conn.execute(text(
+                        "select column_name from information_schema.columns "
+                        f"where table_schema = current_schema() and table_name = '{table}'"))}
+                    assert cols == {c.name for c in model.__table__.columns}  # exactly the model's columns, none stray
 
-        # OLD schema: users without the new flags, daily_sweep_setups without kind/level2/stage, with rows
+        # OLD schema: users without the new flag, daily_sweep_setups with rows
         async with pg() as (engine, Session):
             async with engine.begin() as conn:
                 for table in ("daily_sweep_setups", "users", "daily_sweep_scan_state", "price_alerts", "invite_codes"):
@@ -143,80 +137,56 @@ def test_init_db_idempotent_on_empty_and_old_schema():
             async with Session() as session:
                 row = (await session.execute(select(DailySweepSetup))).scalar_one()
                 user = await session.get(User, "1")
-            assert (row.kind, row.stage, row.level2) == ("SWEEP", 0, None)
-            assert user.daily_sweep_alerts_enabled is False and user.daily_continuation_alerts_enabled is False
+            assert (row.pair, row.status, row.level) == ("XAUUSD", "ACTIVE", 1)
+            assert user.daily_sweep_alerts_enabled is False
 
     run(body)
 
 
-# ── setups: insert, unique constraint, staged claims, expiry ────────────────
+# ── setups: insert, unique constraint, atomic claim, expiry ─────────────────
 
-def test_insert_unique_constraint_and_staged_claims():
+def test_insert_unique_constraint_and_atomic_claim():
     async def body():
         async with pg() as (engine, Session):
             svc, _, _ = _service()
 
             sweep = await svc._store_setup(*_sweep_args())
-            cont = await svc._store_setup(*_cont_args())
-            assert sweep is not None and cont is not None
-            sweep_row, cont_row = await _row(Session, sweep.id), await _row(Session, cont.id)
-            assert (sweep_row.kind, sweep_row.stage, sweep_row.level2, sweep_row.status) == ("SWEEP", 0, None, ACTIVE)
-            assert (cont_row.kind, cont_row.stage, cont_row.status) == ("CONTINUATION", 0, ACTIVE)
-            assert (cont_row.level, cont_row.level2) == (110.762, 110.515)
-            assert cont_row.day2_date == D(2026, 10, 27) and cont_row.day3_expires_at == utc(2026, 10, 28, 21)
-            assert sweep.level2 is None and cont.kind == "CONTINUATION" and cont.level2 == 110.515
+            assert sweep is not None
+            row = await _row(Session, sweep.id)
+            assert (row.pair, row.direction, row.status, row.level) == ("EURUSD", "SELL", ACTIVE, 105)
+            assert row.day2_date == D(2026, 10, 28) and row.day3_expires_at == utc(2026, 10, 29, 21)
+            assert (row.triggered_at, row.trigger_price) == (None, None)
 
-            # Unique (pair, day2_date): the service's ON CONFLICT DO NOTHING stores nothing...
+            # Unique (pair, day2_date): the service's ON CONFLICT DO NOTHING stores nothing for a rescan...
             assert await svc._store_setup(*_sweep_args()) is None
-            assert await svc._store_setup(*_cont_args()) is None
-            # ...even for the other pattern kind on the same Day 2 (a Day 2 can only match one)
-            pair, signal, d1, d2, expires = _cont_args()
-            assert await svc._store_setup(pair, detect_sweep(*_sweep_args()[2:4]), d1, d2, expires) is None
             # ...and a plain INSERT is rejected by the constraint itself
             async with Session() as session:
                 session.add(DailySweepSetup(
-                    pair="AUDJPY", kind="CONTINUATION", direction="BUY", level=1, level2=2, stage=0, status=ACTIVE,
+                    pair="EURUSD", direction="SELL", level=1, status=ACTIVE,
                     day1_open=1, day1_high=1, day1_low=1, day1_close=1, day2_open=1, day2_high=1, day2_low=1, day2_close=1,
-                    day2_date=D(2026, 10, 27), day3_expires_at=utc(2026, 10, 28, 21)))
+                    day2_date=D(2026, 10, 28), day3_expires_at=utc(2026, 10, 29, 21)))
                 with pytest.raises(IntegrityError) as excinfo:
                     await session.commit()
             assert "uq_daily_sweep_pair_day2" in str(excinfo.value.orig)
-            async with Session() as session:
-                assert len((await session.execute(select(DailySweepSetup))).scalars().all()) == 2
+            # A different pair, or the same pair on another Day 2, is fine
+            assert await svc._store_setup(*_sweep_args("GBPUSD")) is not None
+            assert await svc._store_setup(*_sweep_args("EURUSD", D(2026, 10, 27))) is not None
 
-            # Continuation stage 0 -> 1: still ACTIVE, price/time recorded
-            assert await svc._claim_stage(cont, 0, 1, 110.760, MID_DAY3) is True
-            row = await _row(Session, cont.id)
-            assert (row.stage, row.status, row.trigger_price, row.triggered_at) == (1, ACTIVE, 110.760, MID_DAY3)
-            # A repeat claim of the same stage matches nothing
-            assert await svc._claim_stage(cont, 0, 1, 110.760, MID_DAY3) is False
-            # Stage 1 -> 2 completes it; repeats and skipping back are refused
-            assert await svc._claim_stage(cont, 1, 2, 110.510, MID_DAY3) is True
-            row = await _row(Session, cont.id)
-            assert (row.stage, row.status, row.trigger_price) == (2, TRIGGERED, 110.510)
-            assert await svc._claim_stage(cont, 1, 2, 110.510, MID_DAY3) is False
-            assert await svc._claim_stage(cont, 0, 2, 110.510, MID_DAY3) is False
-            assert (await _row(Session, cont.id)).stage == 2
-
-            # A sweep has one stage: 0 -> 1 completes it
-            assert await svc._claim_stage(sweep, 0, 1, 105.0, MID_DAY3) is True
+            # ACTIVE -> TRIGGERED exactly once, recording price and time
+            assert await svc._claim(sweep, 105.5, MID_DAY3) is True
             row = await _row(Session, sweep.id)
-            assert (row.stage, row.status) == (1, TRIGGERED)
-            assert await svc._claim_stage(sweep, 0, 1, 105.0, MID_DAY3) is False
-
-            # Combined 0 -> 2 straight from stage 0
-            combined = await svc._store_setup(*_cont_args("GBPJPY"))
-            assert await svc._claim_stage(combined, 0, 2, 110.0, MID_DAY3) is True
-            assert (await _row(Session, combined.id)).status == TRIGGERED
+            assert (row.status, row.trigger_price, row.triggered_at) == (TRIGGERED, 105.5, MID_DAY3)
+            assert await svc._claim(sweep, 105.5, MID_DAY3) is False  # a repeat claim matches nothing
+            assert (await _row(Session, sweep.id)).status == TRIGGERED
 
             # A claim at/after day3_expires_at returns nothing and changes nothing
-            late = await svc._store_setup(*_cont_args("NZDJPY"))
+            late = await svc._store_setup(*_sweep_args("NZDUSD"))
             expiry = late.day3_expires_at
-            assert await svc._claim_stage(late, 0, 1, 110.7, expiry) is False  # exactly at expiry: not "> now"
-            assert await svc._claim_stage(late, 0, 1, 110.7, expiry + datetime.timedelta(seconds=1)) is False
+            assert await svc._claim(late, 105.5, expiry) is False  # exactly at expiry: not "> now"
+            assert await svc._claim(late, 105.5, expiry + datetime.timedelta(seconds=1)) is False
             row = await _row(Session, late.id)
-            assert (row.stage, row.status, row.trigger_price) == (0, ACTIVE, None)
-            assert await svc._claim_stage(late, 0, 1, 110.7, expiry - datetime.timedelta(seconds=1)) is True
+            assert (row.status, row.trigger_price, row.triggered_at) == (ACTIVE, None, None)
+            assert await svc._claim(late, 105.5, expiry - datetime.timedelta(seconds=1)) is True
 
     run(body)
 
@@ -225,27 +195,21 @@ def test_expire_bootstrap_and_list_active():
     async def body():
         async with pg() as (engine, Session):
             svc, _, sent = _service()
-            cont = await svc._store_setup(*_cont_args())  # Day 3 ends Wed 28 Oct 21:00 UTC
-            sweep = await svc._store_setup(*_sweep_args())  # Day 3 ends Thu 29 Oct 21:00 UTC
-            done = await svc._store_setup(*_cont_args("GBPJPY"))
-            await svc._claim_stage(cont, 0, 1, 110.76, MID_DAY3)  # cont is at stage 1 (Level 1 hit)
-            await svc._claim_stage(done, 0, 2, 110.40, MID_DAY3)  # complete -> TRIGGERED
+            first = await svc._store_setup(*_sweep_args("AUDUSD", D(2026, 10, 27)))  # Day 3 ends Wed 28 Oct 21:00 UTC
+            second = await svc._store_setup(*_sweep_args("EURUSD", D(2026, 10, 28)))  # Day 3 ends Thu 29 Oct 21:00 UTC
+            done = await svc._store_setup(*_sweep_args("GBPUSD", D(2026, 10, 28)))
+            await svc._claim(done, 105.5, MID_DAY3)  # already TRIGGERED
 
-            # Restart mid-way: bootstrap reloads ACTIVE rows with kind/level2/stage intact
+            # Restart: bootstrap reloads only the ACTIVE rows
             await svc.bootstrap()
-            cached = {s.pair: s for pair_setups in svc._active.values() for s in pair_setups}
-            assert set(cached) == {"AUDJPY", "EURUSD"}
-            assert (cached["AUDJPY"].kind, cached["AUDJPY"].stage, cached["AUDJPY"].level2) == ("CONTINUATION", 1, 110.515)
-            assert (cached["EURUSD"].kind, cached["EURUSD"].stage, cached["EURUSD"].level2) == ("SWEEP", 0, None)
-            assert svc.active_symbols() == {"AUDJPY", "EURUSD"}
-            assert {s.pair for s in await svc.list_active()} == {"AUDJPY", "EURUSD"}
+            assert svc.active_symbols() == {"AUDUSD", "EURUSD"}
+            assert {s.pair for s in await svc.list_active()} == {"AUDUSD", "EURUSD"}
 
-            # After the continuation's Day 3 close: expire_setups flips only that one, silently
-            svc.clock = lambda: utc(2026, 10, 28, 21, 0, ) + datetime.timedelta(seconds=1)
+            # After the first setup's Day 3 close: expire_setups flips only that one, silently
+            svc.clock = lambda: utc(2026, 10, 28, 21, 0) + datetime.timedelta(seconds=1)
             assert await svc.expire_setups() == 1
-            row = await _row(Session, cont.id)
-            assert (row.status, row.stage) == (EXPIRED, 1)  # stage preserved: it expired after Level 1
-            assert (await _row(Session, sweep.id)).status == ACTIVE
+            assert (await _row(Session, first.id)).status == EXPIRED
+            assert (await _row(Session, second.id)).status == ACTIVE
             assert (await _row(Session, done.id)).status == TRIGGERED  # completed rows are never rewritten
             assert svc.active_symbols() == {"EURUSD"}
             assert [s.pair for s in await svc.list_active()] == ["EURUSD"]
@@ -280,9 +244,9 @@ def test_scan_state_row_read_and_update():
     run(body)
 
 
-# ── users: opt-in flags ─────────────────────────────────────────────────────
+# ── users: opt-in flag ──────────────────────────────────────────────────────
 
-def test_user_opt_in_flags_toggle_independently():
+def test_user_opt_in_flag_toggles():
     async def body():
         async with pg() as (engine, Session):
             users = UsersService()
@@ -293,63 +257,49 @@ def test_user_opt_in_flags_toggle_independently():
                 ])
                 await session.commit()
 
-            async def ids(finder):
-                return sorted(u.chat_id for u in await finder())
+            async def ids():
+                return sorted(u.chat_id for u in await users.find_daily_sweep_subscribers())
 
-            assert await ids(users.find_daily_sweep_subscribers) == []
-            assert await ids(users.find_daily_continuation_subscribers) == []
-
+            assert await ids() == []
             await users.set_daily_sweep_alerts_enabled("a", True)
-            await users.set_daily_continuation_alerts_enabled("b", True)
             await users.set_daily_sweep_alerts_enabled("c", True)
-            await users.set_daily_continuation_alerts_enabled("c", True)
-            assert await ids(users.find_daily_sweep_subscribers) == ["a"]
-            assert await ids(users.find_daily_continuation_subscribers) == ["b"]
-            assert await ids(users.find_digest_subscribers) == ["a", "b"]  # either flag; c is unapproved
-
-            await users.set_daily_continuation_alerts_enabled("a", True)  # a: both
-            assert await ids(users.find_daily_continuation_subscribers) == ["a", "b"]
-            await users.set_daily_sweep_alerts_enabled("a", False)  # turning one off leaves the other on
-            assert await ids(users.find_daily_sweep_subscribers) == []
-            assert await ids(users.find_daily_continuation_subscribers) == ["a", "b"]
-            await users.set_daily_continuation_alerts_enabled("a", False)
-            await users.set_daily_continuation_alerts_enabled("b", False)
-            assert await ids(users.find_digest_subscribers) == []
+            assert await ids() == ["a"]  # c is unapproved
+            await users.set_daily_sweep_alerts_enabled("b", True)
+            assert await ids() == ["a", "b"]
+            await users.set_daily_sweep_alerts_enabled("a", False)
+            assert await ids() == ["b"]
 
     run(body)
 
 
-# ── end to end on real rows: ticks -> claims -> messages ────────────────────
+# ── end to end on real rows: ticks -> claim -> message ──────────────────────
 
 def test_ticks_end_to_end_with_real_claims_and_two_instances():
     async def body():
         async with pg() as (engine, Session):
             svc, users, sent = _service()
             async with Session() as session:
-                session.add_all([User(chat_id="cont", is_approved=True), User(chat_id="sweep", is_approved=True)])
+                session.add_all([User(chat_id="on", is_approved=True), User(chat_id="off", is_approved=True)])
                 await session.commit()
-            await users.set_daily_continuation_alerts_enabled("cont", True)
-            await users.set_daily_sweep_alerts_enabled("sweep", True)
+            await users.set_daily_sweep_alerts_enabled("on", True)
 
-            setup = await svc._store_setup(*_cont_args())
+            setup = await svc._store_setup(*_sweep_args())
             await svc.bootstrap()
 
-            for price in (110.900, 110.760, 110.760, 110.700, 110.510, 110.510, 110.400):
-                await svc.check_tick("AUDJPY", price, None)
-            assert [chat for chat, _ in sent] == ["cont", "cont"]  # only continuation subscribers, two stages
-            assert "LEVEL 1 HIT" in sent[0][1] and "LEVEL 2 HIT" in sent[1][1]
-            row = await _row(Session, setup.id)
-            assert (row.stage, row.status) == (2, TRIGGERED)
+            for price in (104.0, 105.0, 105.0, 106.0):  # SELL: fires when price trades up to 105, once
+                await svc.check_tick("EURUSD", price, None)
+            assert [chat for chat, _ in sent] == ["on"]  # only /sweepalerts subscribers
+            assert "DAILY SWEEP LEVEL HIT — EURUSD (SELL)" in sent[0][1]
+            assert (await _row(Session, setup.id)).status == TRIGGERED
 
-            # Two instances that both loaded the setup at stage 0 race on the same tick: one winner
-            sent.clear()
-            other = await svc._store_setup(*_cont_args("GBPJPY"))
+            # Two instances that both loaded the setup race on the same tick: one winner
+            other = await svc._store_setup(*_sweep_args("GBPUSD"))
             a, _, sent_a = _service()
             b, _, sent_b = _service()
             await a.bootstrap()
             await b.bootstrap()
-            await asyncio.gather(a.check_tick("GBPJPY", 110.700, None), b.check_tick("GBPJPY", 110.700, None))
-            assert len(sent_a) + len(sent_b) == 1
-            assert (await _row(Session, other.id)).stage == 1
+            await asyncio.gather(a.check_tick("GBPUSD", 105.5, None), b.check_tick("GBPUSD", 105.5, None))
+            assert len(sent_a) + len(sent_b) == 1  # one winner sends (to the one subscriber); the loser sends nothing
+            assert (await _row(Session, other.id)).status == TRIGGERED
 
     run(body)
