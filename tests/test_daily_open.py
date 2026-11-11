@@ -8,12 +8,11 @@ import pytest
 
 import app.services.daily_sweep_service as sm
 from app.services.daily_sweep_service import (
-    CONT_SELL,
     DailySweepService,
     aggregate_1h_to_daily,
-    classify_continuation,
-    detect_continuation,
     detect_sweep,
+    is_bearish,
+    is_bullish,
     open_note,
     pip_size,
 )
@@ -84,7 +83,7 @@ def test_falls_back_to_the_first_bar_when_the_previous_day_is_unavailable():
     assert wed.open == 99 and wed.open_from_prev_close is False
 
 
-# ── EURNZD Fri -> Mon -> Tue: no false CONTINUATION SELL ────────────────────
+# ── EURNZD Fri -> Mon -> Tue: Monday's colour ───────────────────────────────
 
 def _eurnzd_three_days():
     fri, _, bot_mon = REAL["EURNZD"]
@@ -93,34 +92,30 @@ def _eurnzd_three_days():
     return aggregate_1h_to_daily(bars, utc(2026, 10, 28, 12))
 
 
-def test_eurnzd_mon_tue_is_no_longer_a_continuation_sell():
+def test_eurnzd_monday_is_bullish_with_the_previous_close_open():
     friday, monday, tuesday = _eurnzd_three_days()
-    assert monday.open == 1.96594 and monday.close == 1.96693 and monday.close > monday.open  # bullish
+    assert monday.open == 1.96594 and monday.close == 1.96693 and monday.close > monday.open
+    assert is_bullish(monday, "EURNZD") and not is_bearish(monday, "EURNZD")
     assert tuesday.open == monday.close  # Day 2 opens at Day 1's close
     assert (tuesday.high, tuesday.low, tuesday.close) == (1.96841, 1.95395, 1.95849)  # bearish Day 2
-    assert classify_continuation(monday, tuesday) == "none"
-    assert detect_continuation(monday, tuesday) is None
-    assert detect_sweep(monday, tuesday) is None  # Day 2 didn't sweep Monday's high either
+    assert detect_sweep(monday, tuesday, "EURNZD") is None  # Day 2 didn't sweep Monday's high
 
 
-def test_eurnzd_old_first_bar_open_reproduces_the_false_sell():
-    _, monday, tuesday = _eurnzd_three_days()
+def test_eurnzd_old_first_bar_open_flipped_mondays_colour():
+    _, monday, _ = _eurnzd_three_days()
     old_monday = dataclasses.replace(monday, open=monday.first_bar_open)  # the pre-fix Monday open 1.97031
-    assert old_monday.open > old_monday.close  # bearish by the wrong open
-    assert classify_continuation(old_monday, tuesday) == CONT_SELL
+    assert old_monday.open > old_monday.close  # bearish by the wrong open — the bug
+    assert is_bearish(old_monday, "EURNZD") and not is_bullish(old_monday, "EURNZD")
 
 
-# ── Gap rule: harmless, but can no longer fire from 1H data ─────────────────
+# ── Day 2's open is always Day 1's close ────────────────────────────────────
 
-def test_gap_between_days_cannot_arise_from_one_hour_data():
+def test_day2_opens_at_day1_close_even_when_its_first_bar_gaps():
     # Tuesday's first bar opens ABOVE Monday's high (111 > 110); with open = previous close it's 105
     bars = day_hours(D(2026, 10, 26), 100, 110, 90, 105) + day_hours(D(2026, 10, 27), 111, 120, 100, 118)
     mon, tue = aggregate_1h_to_daily(bars, utc(2026, 10, 28, 22))
-    assert tue.open == 105 < mon.high
-    assert classify_continuation(mon, tue) != "skipped (gap)"
-    # The rule itself is intact on candles that do gap
-    gapped = dataclasses.replace(tue, open=111)
-    assert classify_continuation(mon, gapped) == "skipped (gap)"
+    assert tue.open == mon.close == 105 < mon.high
+    assert tue.first_bar_open == 111
 
 
 # ── /sweepcheck notes ───────────────────────────────────────────────────────

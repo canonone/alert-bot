@@ -27,9 +27,6 @@ ACTIVE = "ACTIVE"
 TRIGGERED = "TRIGGERED"
 EXPIRED = "EXPIRED"
 
-SWEEP_KIND = "SWEEP"
-CONTINUATION_KIND = "CONTINUATION"
-
 # The user's charts are FOREX.com on TradingView, where the forex day rolls over at 17:00
 # America/New_York. Twelve Data's own `1day` candles use midnight UTC, which doesn't match, so
 # (like the old 4H feature did for 4H bars) we build the daily candle ourselves from 1H bars.
@@ -117,16 +114,12 @@ OPEN_DIFF_NOTE_PIPS = 2
 # Pattern margins, so small feed differences between Twelve Data and FOREX.com can't create or break
 # a setup. All in pips (0.0001; 0.01 for JPY pairs; 0.1 for XAUUSD — see pip_size); each has a
 # per-pair override dict.
-# - A break must go beyond Day 1's extreme by at least this: the continuation's CLOSE, the sweep's WICK.
-#   ("Did not take the opposite side" checks stay strict, no margin.)
+# - The sweep's WICK must go beyond Day 1's extreme by at least this.
 MIN_BEYOND_PIPS = 3.0
 PAIR_MIN_BEYOND_PIPS: dict[str, float] = {}
 # - A day is only bullish/bearish if |close - open| is at least this; smaller is a doji and matches neither.
 MIN_BODY_PIPS = 2.0
 PAIR_MIN_BODY_PIPS: dict[str, float] = {}
-# - Continuation levels this close together (Level 1 vs Level 2) are one zone: one alert, not two.
-MERGE_LEVELS_PIPS = 3.0
-PAIR_MERGE_LEVELS_PIPS: dict[str, float] = {}
 # - Day 2 only counts as NOT having taken Day 1's opposite extreme if it stayed at least this far away
 #   from it. Twelve Data's extremes can sit a fraction of a pip inside FOREX.com's, so a near-touch is a touch.
 OPPOSITE_SIDE_BUFFER_PIPS = 2.0
@@ -145,10 +138,6 @@ def min_body_pips_for(pair: str) -> float:
 
 def opposite_side_buffer_pips_for(pair: str) -> float:
     return PAIR_OPPOSITE_SIDE_BUFFER_PIPS.get(pair, OPPOSITE_SIDE_BUFFER_PIPS)
-
-
-def merge_levels_pips_for(pair: str) -> float:
-    return PAIR_MERGE_LEVELS_PIPS.get(pair, MERGE_LEVELS_PIPS)
 
 
 def min_daily_bars_for(pair: str) -> int:
@@ -364,17 +353,6 @@ class SweepSignal:
     direction: str  # SELL | BUY
     level: float  # Day 2's open
     sweep_extreme: float  # Day 2 high (SELL) / Day 2 low (BUY) — invalidation idea
-    kind: str = SWEEP_KIND
-    level2: float | None = None
-
-
-@dataclass(frozen=True)
-class ContinuationSignal:
-    direction: str  # BUY | SELL
-    level: float  # Level 1: Day 1's high (BUY) / low (SELL) — the broken extreme
-    level2: float  # Level 2: Day 2's open (always beyond Level 1)
-    sweep_extreme: float  # Day 2 low (BUY) / high (SELL) — invalidation idea
-    kind: str = CONTINUATION_KIND
 
 
 class Check(NamedTuple):
@@ -485,72 +463,6 @@ def detect_sweep(day1: DailyCandle, day2: DailyCandle, pair: str = "") -> SweepS
     return None
 
 
-# Results of classify_continuation
-CONT_BUY = "CONTINUATION BUY"
-CONT_SELL = "CONTINUATION SELL"
-SKIP_GAP = "skipped (gap)"
-SKIP_OPPOSITE = "skipped (took opposite side)"
-NO_CONTINUATION = "none"
-
-
-def continuation_checks(day1: DailyCandle, day2: DailyCandle, direction: str, pair: str = "") -> list[Check]:
-    """Every condition for a continuation. The first three are the pattern itself (two real-bodied
-    candles, and a CLOSE at least MIN_BEYOND_PIPS beyond Day 1's extreme); the last two are the strict
-    exclusions (came within OPPOSITE_SIDE_BUFFER_PIPS of the opposite extreme / gapped past Day 1's extreme).
-
-    The gap exclusion can effectively never fire on candles built by aggregate_1h_to_daily: Day 2's
-    open is Day 1's close, which can't be at or beyond Day 1's high/low unless Day 1 closed exactly
-    on it. It stays as a harmless guard (and for candles whose open fell back to the first bar)."""
-    pip, margin = pip_size(pair), min_beyond_pips_for(pair)
-    if direction == BUY:
-        delta = (day2.close - day1.high) / pip
-        return [
-            _colour_check("Day 1", day1, True, pair),
-            _colour_check("Day 2", day2, True, pair),
-            _margin_check(
-                f"Day 2 to close ≥{margin:g} pips above Day 1's high", delta, margin,
-                _move_text(pair, delta, "it closed {n:.1f} pips above", "it closed {n:.1f} pips below",
-                           "it closed exactly level", day2.close, day1.high)),
-            _stay_away_check(pair, "above Day 1's low", (day2.low - day1.low) / pip, day2.low, day1.low),
-            Check("Day 2 to open below Day 1's high (no gap)", day2.open < day1.high,
-                  _compare(pair, "Day 2 open", day2.open, "Day 1 high", day1.high)),
-        ]
-    delta = (day1.low - day2.close) / pip
-    return [
-        _colour_check("Day 1", day1, False, pair),
-        _colour_check("Day 2", day2, False, pair),
-        _margin_check(
-            f"Day 2 to close ≥{margin:g} pips below Day 1's low", delta, margin,
-            _move_text(pair, delta, "it closed {n:.1f} pips below", "it closed {n:.1f} pips above",
-                       "it closed exactly level", day2.close, day1.low)),
-        _stay_away_check(pair, "below Day 1's high", (day1.high - day2.high) / pip, day2.high, day1.high),
-        Check("Day 2 to open above Day 1's low (no gap)", day2.open > day1.low,
-              _compare(pair, "Day 2 open", day2.open, "Day 1 low", day1.low)),
-    ]
-
-
-def classify_continuation(day1: DailyCandle, day2: DailyCandle, pair: str = "") -> str:
-    for direction, label in ((BUY, CONT_BUY), (SELL, CONT_SELL)):
-        checks = continuation_checks(day1, day2, direction, pair)
-        if all(c.ok for c in checks[:3]):
-            if not checks[3].ok:
-                return SKIP_OPPOSITE
-            if not checks[4].ok:
-                return SKIP_GAP
-            return label
-    return NO_CONTINUATION
-
-
-def detect_continuation(day1: DailyCandle, day2: DailyCandle, pair: str = "") -> ContinuationSignal | None:
-    """Both candles must already be fully closed — the caller guarantees it."""
-    result = classify_continuation(day1, day2, pair)
-    if result == CONT_BUY:
-        return ContinuationSignal(BUY, day1.high, day2.open, day2.low)
-    if result == CONT_SELL:
-        return ContinuationSignal(SELL, day1.low, day2.open, day2.high)
-    return None
-
-
 def level_reached(direction: str, level: float, price: float) -> bool:
     return price >= level if direction == SELL else price <= level
 
@@ -569,40 +481,18 @@ def should_catch_up(last_scanned_day: datetime.date | None, now_utc: datetime.da
     return not is_expired(day3_expiry(expected_day), now_utc)
 
 
-def _failed_lines(day1: DailyCandle, day2: DailyCandle, pair: str, checks_for) -> list[str]:
-    """Failed checks for the direction Day 1's colour points to (bullish -> SELL sweep / BUY continuation,
-    bearish -> the other way), each as "✗ needs X — but Y" with the actual numbers."""
+def explain_no_setup(day1: DailyCandle, day2: DailyCandle, pair: str = "") -> list[str]:
+    """Why detect_sweep returned None: a heading plus one "✗ needs X — but Y" line per failed check,
+    judged against the direction Day 1's colour points to (bullish -> SELL sweep, bearish -> BUY sweep)."""
     bullish, bearish = is_bullish(day1, pair), is_bearish(day1, pair)
     if not bullish and not bearish:
         return [
             f"✗ Day 1 is a doji (body {abs(body_pips(day1, pair)):.1f} pips < {min_body_pips_for(pair):g})"
             " — neither direction applies"
         ]
-    checks, label = checks_for(bullish)
-    return [label] + [c.failure_text() for c in checks if not c.ok]
-
-
-def explain_no_setup(day1: DailyCandle, day2: DailyCandle, pair: str = "") -> list[str]:
-    """Why detect_sweep returned None: a heading plus one "✗ needs X — but Y" line per failed check,
-    judged against the direction Day 1's colour points to."""
-    return _failed_lines(
-        day1, day2, pair,
-        lambda bullish: (
-            sweep_checks(day1, day2, SELL if bullish else BUY, pair),
-            f"{'SELL' if bullish else 'BUY'} sweep (Day 1 closed {'bullish' if bullish else 'bearish'}):",
-        ),
-    )
-
-
-def explain_no_continuation(day1: DailyCandle, day2: DailyCandle, pair: str = "") -> list[str]:
-    """Same for continuations: bullish Day 1 -> BUY continuation, bearish -> SELL continuation."""
-    return _failed_lines(
-        day1, day2, pair,
-        lambda bullish: (
-            continuation_checks(day1, day2, BUY if bullish else SELL, pair),
-            f"{'BUY' if bullish else 'SELL'} continuation (Day 1 closed {'bullish' if bullish else 'bearish'}):",
-        ),
-    )
+    direction = SELL if bullish else BUY
+    heading = f"{direction} sweep (Day 1 closed {'bullish' if bullish else 'bearish'}):"
+    return [heading] + [c.failure_text() for c in sweep_checks(day1, day2, direction, pair) if not c.ok]
 
 
 # ── Pure: message formatting ────────────────────────────────────────────────
@@ -617,46 +507,14 @@ class SetupState:
     level: float
     day2_date: datetime.date
     day3_expires_at: datetime.datetime
-    kind: str = SWEEP_KIND
-    level2: float | None = None  # CONTINUATION only
-    stage: int = 0  # alerts already sent
 
     @property
     def sweep_extreme(self) -> float:
-        """Day 2 high for SELL / Day 2 low for BUY — the invalidation / SL idea for both patterns."""
+        """Day 2 high for SELL / Day 2 low for BUY — the invalidation / SL idea."""
         return self.day2[1] if self.direction == SELL else self.day2[2]
 
-    @property
-    def final_stage(self) -> int:
-        return 2 if self.kind == CONTINUATION_KIND else 1
-
-    @property
-    def levels_apart_pips(self) -> float | None:
-        """Distance between a continuation's two levels, in pips (None for sweeps)."""
-        if self.kind != CONTINUATION_KIND or self.level2 is None:
-            return None
-        return abs(self.level - self.level2) / pip_size(self.pair)
-
-    @property
-    def merged(self) -> bool:
-        """Levels within MERGE_LEVELS_PIPS are one zone: a single alert when Level 1 is reached."""
-        apart = self.levels_apart_pips
-        return apart is not None and apart <= merge_levels_pips_for(self.pair) + _PIP_EPS
-
-    def next_stage(self, price: float) -> int | None:
-        """The stage this price would move the setup to, or None if it fires nothing. A price past
-        both continuation levels at stage 0 jumps straight to 2 (one combined message)."""
-        if self.stage >= self.final_stage:
-            return None
-        if self.stage == 0:
-            if not level_reached(self.direction, self.level, price):
-                return None
-            if self.merged:
-                return 2  # one zone: reaching Level 1 completes the setup
-            if self.kind == CONTINUATION_KIND and level_reached(self.direction, self.level2, price):
-                return 2
-            return 1
-        return 2 if level_reached(self.direction, self.level2, price) else None
+    def reached(self, price: float) -> bool:
+        return level_reached(self.direction, self.level, price)
 
     @classmethod
     def from_model(cls, row: DailySweepSetup) -> "SetupState":
@@ -669,9 +527,6 @@ class SetupState:
             level=row.level,
             day2_date=row.day2_date,
             day3_expires_at=row.day3_expires_at,
-            kind=row.kind,
-            level2=row.level2,
-            stage=row.stage,
         )
 
 
@@ -680,41 +535,17 @@ def _ohlc_str(pair: str, ohlc: tuple[float, float, float, float]) -> str:
     return f"O {o} · H {h} · L {l} · C {c}"
 
 
-def format_new_setups_digest(
-    setups: list[SetupState], include_sweeps: bool = True, include_continuations: bool = True
-) -> str | None:
-    """One message per user, with only the sections they opted into. None if there's nothing to show."""
-    sweeps = [x for x in setups if x.kind == SWEEP_KIND] if include_sweeps else []
-    continuations = [x for x in setups if x.kind == CONTINUATION_KIND] if include_continuations else []
-    shown = sweeps + continuations
-    if not shown:
-        return None
-
-    expiries = {x.day3_expires_at for x in shown}
-    suffix = lambda x: f" · until {_wat_str(x.day3_expires_at)}" if len(expiries) > 1 else ""  # noqa: E731
-
-    lines = ["🗓 <b>Daily Setups</b>", "━━━━━━━━━━━━━━━━━━━━"]
-    if sweeps:
-        lines.append("<b>🔁 Sweeps</b>")
-        for x in sweeps:
-            emoji = "🔻" if x.direction == SELL else "🔺"
-            side = "high" if x.direction == SELL else "low"
-            lines.append(
-                f"{emoji} <b>{x.pair}</b> {x.direction} @ {format_price(x.pair, x.level)}"
-                f" · sweep {side} {format_price(x.pair, x.sweep_extreme)}{suffix(x)}"
-            )
-    if sweeps and continuations:
-        lines.append("")
-    if continuations:
-        lines.append("<b>📈 Continuations</b>")
-        for x in continuations:
-            emoji = "🔻" if x.direction == SELL else "🔺"
-            side = "high" if x.direction == BUY else "low"
-            lines.append(f"{emoji} <b>{x.pair}</b> {x.direction}")
-            lines.append(f"   ① Day 1 {side}: {format_price(x.pair, x.level)}")
-            lines.append(f"   ② Day 2 open: {format_price(x.pair, x.level2)}{suffix(x)}")
-            if x.merged:
-                lines.append(f"   single alert (levels {x.levels_apart_pips:.1f} pips apart)")
+def format_new_setups_digest(setups: list[SetupState]) -> str:
+    lines = ["🗓 <b>Daily Sweep — New Setups</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    expiries = {s.day3_expires_at for s in setups}
+    for s in setups:
+        emoji = "🔻" if s.direction == SELL else "🔺"
+        side = "high" if s.direction == SELL else "low"
+        lines.append(f"{emoji} <b>{s.pair}</b> {s.direction} @ {format_price(s.pair, s.level)}")
+        detail = f"   Day 2 {side} (sweep): {format_price(s.pair, s.sweep_extreme)}"
+        if len(expiries) > 1:
+            detail += f" · until {_wat_str(s.day3_expires_at)}"
+        lines.append(detail)
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     if len(expiries) == 1:
         lines.append(f"⏳ Valid until Day 3 close: {_wat_str(next(iter(expiries)))}")
@@ -754,71 +585,6 @@ def format_level_hit(
             if pre_armed
             else ""
         )
-    )
-
-
-def _single_alert_note(pair: str, signal: "ContinuationSignal") -> str:
-    apart = abs(signal.level - signal.level2) / pip_size(pair)
-    if apart <= merge_levels_pips_for(pair) + _PIP_EPS:
-        return f" — single alert (levels {apart:.1f} pips apart)"
-    return ""
-
-
-def format_continuation_hit(
-    setup: SetupState,
-    price: float,
-    now_utc: datetime.datetime,
-    hit: str,  # "1" | "2" | "both"
-    pre_armed: bool = False,
-) -> str:
-    """`both` for a merged setup (levels within MERGE_LEVELS_PIPS) is ONE zone alert at Level 1."""
-    pair = setup.pair
-    is_buy = setup.direction == BUY
-    broken = "High" if is_buy else "Low"
-    stop_side = "Low" if is_buy else "High"
-    l1 = format_price(pair, setup.level)
-    l2 = format_price(pair, setup.level2)
-    current = f"💰 <b>Current Price:</b> {format_price(pair, price)}"
-    level1_line = f"① <b>Day 1 {broken} (broken):</b> {l1}"
-    stop_line = f"🛡 <b>Day 2 {stop_side}:</b> {format_price(pair, setup.sweep_extreme)} — invalidation / SL idea"
-
-    if hit == "1":
-        title = "CONTINUATION · LEVEL 1 HIT"
-        body = [level1_line, current, f"② <b>Next level — Day 2 Open:</b> {l2}", stop_line]
-        close_word = "bullish close above" if is_buy else "bearish close below"
-        explanation = f"✅ Price pulled back to the broken Day 1 {broken.lower()} after a {close_word} it."
-    elif hit == "2":
-        title = "CONTINUATION · LEVEL 2 HIT"
-        body = [f"② <b>Day 2 Open:</b> {l2}", current, level1_line, stop_line]
-        explanation = (
-            f"⚠️ Day 1's {broken.lower()} didn't hold — price is now at Day 2's open, "
-            "the deepest level for this setup."
-        )
-    else:
-        title = "CONTINUATION · LEVELS 1 & 2 HIT"
-        body = [level1_line, f"② <b>Day 2 Open:</b> {l2}", current, stop_line]
-        if setup.merged:
-            close_word = "bullish close above" if is_buy else "bearish close below"
-            explanation = (
-                f"✅ Price pulled back to the broken Day 1 {broken.lower()} after a {close_word} it.\n"
-                f"ℹ️ Levels are only {setup.levels_apart_pips:.1f} pips apart — treated as one zone."
-            )
-        else:
-            explanation = (
-                f"⚠️ Price went through the broken Day 1 {broken.lower()} and on to Day 2's open — "
-                "the deepest level for this setup."
-            )
-    return (
-        f"🎯 <b>{title} — {pair} ({setup.direction})</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        + "\n".join(body)
-        + "\n"
-        f"📅 <b>Day 1:</b> {_ohlc_str(pair, setup.day1)}\n"
-        f"📅 <b>Day 2:</b> {_ohlc_str(pair, setup.day2)}\n"
-        f"🕐 <b>Time:</b> {_wat_str(now_utc)}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{explanation}"
-        + ("\n⚡ Level was reached before the setup was armed (between Day 2 close and the scan)." if pre_armed else "")
     )
 
 
@@ -958,22 +724,14 @@ class DailySweepService:
                 update(DailySweepSetup)
                 .where(DailySweepSetup.status == ACTIVE, DailySweepSetup.day3_expires_at <= now)
                 .values(status=EXPIRED)
-                .returning(
-                    DailySweepSetup.id,
-                    DailySweepSetup.pair,
-                    DailySweepSetup.direction,
-                    DailySweepSetup.kind,
-                    DailySweepSetup.stage,
-                )
+                .returning(DailySweepSetup.id, DailySweepSetup.pair, DailySweepSetup.direction)
             )
             expired = result.all()
             await session.commit()
-        # Silent by design: expiry is logged, never messaged (also when a continuation got only Level 1)
-        for setup_id, pair, direction, kind, stage in expired:
+        # Silent by design: expiry is logged, never messaged
+        for setup_id, pair, direction in expired:
             self._cache_remove(setup_id)
-            logger.info(
-                f"[DailySweep] {pair} {kind} {direction} setup #{setup_id} expired at stage {stage} (Day 3 ended)"
-            )
+            logger.info(f"[DailySweep] {pair} {direction} setup #{setup_id} expired unfilled (Day 3 ended)")
         return len(expired)
 
     # ── Scan ─────────────────────────────────────────────────────────────────
@@ -1004,7 +762,7 @@ class DailySweepService:
 
             new_setups = report.new_setups
             if new_setups:
-                await self._broadcast_digest(new_setups)
+                await self._broadcast(format_new_setups_digest(new_setups))
                 # After the digest, so the "level hit" message reads as a follow-up to it
                 for setup in new_setups:
                     await self._trigger_if_already_reached(setup)
@@ -1014,9 +772,9 @@ class DailySweepService:
             return report
 
     async def _trigger_if_already_reached(self, setup: SetupState) -> None:
-        """Price may already be at/through the level(s) between Day 2's close and the scan."""
+        """Price may already be at/through the level between Day 2's close and the scan."""
         price = await self._price_for_arming(setup.pair)
-        if price is None or setup.next_stage(price) is None:
+        if price is None or not setup.reached(price):
             return
         logger.info(f"[DailySweep] {setup.pair} level {setup.level} already reached (last price {price}) when armed")
         await self._trigger(setup, price, self.clock(), pre_armed=True)
@@ -1118,16 +876,9 @@ class DailySweepService:
         day1, day2 = days
 
         # The same candles feed both features; a Day 2 can match at most one of the four patterns
-        signal: SweepSignal | ContinuationSignal | None = detect_sweep(day1, day2, pair) or detect_continuation(
-            day1, day2, pair
-        )
+        signal = detect_sweep(day1, day2, pair)
         if signal is None:
-            logger.info(
-                f"[DailySweep] {pair} no setup — "
-                + " ".join(explain_no_setup(day1, day2, pair))
-                + f" | continuation: {classify_continuation(day1, day2, pair)} "
-                + " ".join(explain_no_continuation(day1, day2, pair))
-            )
+            logger.info(f"[DailySweep] {pair} no setup — " + " ".join(explain_no_setup(day1, day2, pair)))
             return PairScan(pair, "none")
 
         expires_at = day3_expiry(day2.date)
@@ -1141,9 +892,8 @@ class DailySweepService:
 
         self._cache_add(setup)
         logger.info(
-            f"[DailySweep] {pair} NEW {signal.kind} {signal.direction} setup #{setup.id} level "
-            f"{signal.level}" + (f" / {signal.level2}" if signal.level2 is not None else "")
-            + f" (Day 2 {day2.date}) valid until {_wat_str(expires_at)}"
+            f"[DailySweep] {pair} NEW {signal.direction} setup #{setup.id} level "
+            f"{signal.level} (Day 2 {day2.date}) valid until {_wat_str(expires_at)}"
         )
         if self.subscribe_symbol is not None:
             try:
@@ -1155,20 +905,17 @@ class DailySweepService:
     async def _store_setup(
         self,
         pair: str,
-        signal: SweepSignal | ContinuationSignal,
+        signal: SweepSignal,
         day1: DailyCandle,
         day2: DailyCandle,
         expires_at: datetime.datetime,
     ) -> SetupState | None:
         values = dict(
             pair=pair,
-            kind=signal.kind,
             direction=signal.direction,
             day1_open=day1.open, day1_high=day1.high, day1_low=day1.low, day1_close=day1.close,
             day2_open=day2.open, day2_high=day2.high, day2_low=day2.low, day2_close=day2.close,
             level=signal.level,
-            level2=signal.level2,
-            stage=0,
             day2_date=day2.date,
             day3_expires_at=expires_at,
             status=ACTIVE,
@@ -1194,8 +941,6 @@ class DailySweepService:
             level=signal.level,
             day2_date=day2.date,
             day3_expires_at=expires_at,
-            kind=signal.kind,
-            level2=signal.level2,
         )
 
     # ── Real-time tick monitoring ────────────────────────────────────────────
@@ -1208,64 +953,38 @@ class DailySweepService:
         for setup in list(setups):
             if is_expired(setup.day3_expires_at, now):
                 continue  # expiry job hasn't run yet — never fire after Day 3 has closed
-            if setup.next_stage(price) is not None:
+            if setup.reached(price):
                 await self._trigger(setup, price, now)
 
     async def _trigger(
         self, setup: SetupState, price: float, now: datetime.datetime, pre_armed: bool = False
     ) -> None:
-        """Move the setup to the stage this price reaches and send that stage's message — once."""
-        to_stage = setup.next_stage(price)
-        if to_stage is None:
-            return
-        from_stage = setup.stage
-        complete = to_stage >= setup.final_stage
-
-        # Advance in memory BEFORE awaiting the database, so a duplicate or concurrent tick can't
-        # re-enter this stage; a finished setup also leaves the cache.
-        setup.stage = to_stage
-        if complete:
-            self._cache_remove(setup.id)
+        # Drop from the cache first so the very next tick can't re-enter this setup
+        self._cache_remove(setup.id)
         try:
-            claimed = await self._claim_stage(setup, from_stage, to_stage, price, now)
+            claimed = await self._claim(setup, price, now)
         except Exception as error:
-            logger.error(f"[DailySweep] Could not record setup #{setup.id} stage {to_stage}, will retry on next tick: {error}")
-            setup.stage = from_stage
-            if complete:
-                self._cache_add(setup)
+            logger.error(f"[DailySweep] Could not mark setup #{setup.id} triggered, will retry on next tick: {error}")
+            self._cache_add(setup)
             return
         if not claimed:
-            # The database says another path already advanced or expired it — never send
-            self._cache_remove(setup.id)
             return
 
-        logger.info(
-            f"[DailySweep] {setup.pair} {setup.kind} {setup.direction} stage {from_stage}->{to_stage} "
-            f"@ {price} (setup #{setup.id})"
-        )
-        if setup.kind == CONTINUATION_KIND:
-            hit = "both" if (from_stage == 0 and to_stage == 2) else str(to_stage)
-            message = format_continuation_hit(setup, price, now, hit, pre_armed)
-        else:
-            message = format_level_hit(setup, price, now, pre_armed)
-        await self._broadcast(message, setup.kind)
+        logger.info(f"[DailySweep] {setup.pair} {setup.direction} level {setup.level} hit @ {price} (setup #{setup.id})")
+        await self._broadcast(format_level_hit(setup, price, now, pre_armed))
 
-    async def _claim_stage(
-        self, setup: SetupState, from_stage: int, to_stage: int, price: float, now: datetime.datetime
-    ) -> bool:
-        """Atomic: only the caller that moves the row from `from_stage` (while still ACTIVE and not
-        past Day 3) gets rowcount 1, so a restart or duplicate tick can never re-send a stage."""
-        status = TRIGGERED if to_stage >= setup.final_stage else ACTIVE
+    async def _claim(self, setup: SetupState, price: float, now: datetime.datetime) -> bool:
+        """Atomic ACTIVE -> TRIGGERED: only the caller that flips the row (and only before Day 3 has
+        closed) gets rowcount 1, so a restart or duplicate tick can never send the alert twice."""
         async with SessionLocal() as session:
             result = await session.execute(
                 update(DailySweepSetup)
                 .where(
                     DailySweepSetup.id == setup.id,
                     DailySweepSetup.status == ACTIVE,
-                    DailySweepSetup.stage == from_stage,
                     DailySweepSetup.day3_expires_at > now,
                 )
-                .values(stage=to_stage, status=status, triggered_at=now, trigger_price=price)
+                .values(status=TRIGGERED, triggered_at=now, trigger_price=price)
             )
             claimed = result.rowcount == 1
             await session.commit()
@@ -1273,24 +992,9 @@ class DailySweepService:
 
     # ── Notifications ────────────────────────────────────────────────────────
 
-    async def _broadcast(self, message: str, kind: str = SWEEP_KIND) -> None:
-        if kind == CONTINUATION_KIND:
-            subscribers = await self.users_service.find_daily_continuation_subscribers()
-        else:
-            subscribers = await self.users_service.find_daily_sweep_subscribers()
-        for user in subscribers:
+    async def _broadcast(self, message: str) -> None:
+        for user in await self.users_service.find_daily_sweep_subscribers():
             await self.send_message(user.chat_id, message)
-
-    async def _broadcast_digest(self, setups: list[SetupState]) -> None:
-        """ONE digest per scan; each user only sees the sections they opted into."""
-        for user in await self.users_service.find_digest_subscribers():
-            message = format_new_setups_digest(
-                setups,
-                include_sweeps=user.daily_sweep_alerts_enabled,
-                include_continuations=user.daily_continuation_alerts_enabled,
-            )
-            if message is not None:
-                await self.send_message(user.chat_id, message)
 
     # ── Commands ─────────────────────────────────────────────────────────────
 
@@ -1307,26 +1011,14 @@ class DailySweepService:
     async def get_sweeps_message(self) -> str:
         setups = await self.list_active()
         if not setups:
-            return "🗓 <b>Daily Setups</b>\n\nNo active setups right now."
-        lines = ["🗓 <b>Daily Setups — Active</b>", "━━━━━━━━━━━━━━━━━━━━"]
+            return "🗓 <b>Daily Sweep</b>\n\nNo active setups right now."
+        lines = ["🗓 <b>Daily Sweep — Active Setups</b>", "━━━━━━━━━━━━━━━━━━━━"]
         for s in setups:
             emoji = "🔻" if s.direction == SELL else "🔺"
-            if s.kind == CONTINUATION_KIND:
-                side = "high" if s.direction == BUY else "low"
-                hit1 = "✅ hit" if s.stage >= 1 else "⏳ waiting"
-                hit2 = "✅ hit" if s.stage >= 2 else "⏳ waiting" if s.stage == 1 else "⏳ after ①"
-                lines.append(
-                    f"📈 CONTINUATION {emoji} <b>{s.pair}</b> {s.direction}\n"
-                    f"   ① Day 1 {side}: {format_price(s.pair, s.level)} — {hit1}\n"
-                    f"   ② Day 2 open: {format_price(s.pair, s.level2)} — {hit2}\n"
-                    + (f"   single alert (levels {s.levels_apart_pips:.1f} pips apart)\n" if s.merged else "")
-                    + f"   Expires: {_wat_str(s.day3_expires_at)}"
-                )
-            else:
-                lines.append(
-                    f"🔁 SWEEP {emoji} <b>{s.pair}</b> {s.direction} @ {format_price(s.pair, s.level)}\n"
-                    f"   Expires: {_wat_str(s.day3_expires_at)}"
-                )
+            lines.append(
+                f"{emoji} <b>{s.pair}</b> {s.direction} @ {format_price(s.pair, s.level)}\n"
+                f"   Expires: {_wat_str(s.day3_expires_at)}"
+            )
         lines.append("━━━━━━━━━━━━━━━━━━━━")
         return "\n".join(lines)
 
@@ -1378,21 +1070,6 @@ class DailySweepService:
                     lines.append(
                         f"{emoji} <b>Sweep {signal.direction} setup</b> — level (Day 2 open) "
                         f"{format_price(pair, signal.level)}, valid until "
-                        f"{_wat_str(day3_expiry(day2.date))}"
-                    )
-                continuation = detect_continuation(day1, day2, pair)
-                if continuation is None:
-                    head, *failed = explain_no_continuation(day1, day2, pair)
-                    lines.append(f"📈 Continuation: {classify_continuation(day1, day2, pair)} — {html.escape(head)}")
-                    lines.extend(f"   {html.escape(line)}" for line in failed)
-                else:
-                    emoji = "🔻" if continuation.direction == SELL else "🔺"
-                    side = "high" if continuation.direction == BUY else "low"
-                    lines.append(
-                        f"{emoji} <b>Continuation {continuation.direction} setup</b> — "
-                        f"① Day 1 {side} {format_price(pair, continuation.level)}, "
-                        f"② Day 2 open {format_price(pair, continuation.level2)}"
-                        f"{_single_alert_note(pair, continuation)}, valid until "
                         f"{_wat_str(day3_expiry(day2.date))}"
                     )
         return "\n".join(lines)

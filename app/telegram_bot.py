@@ -125,8 +125,6 @@ class TelegramBotService:
             await self._handle_pairs(chat_id)
         elif command == "/sweepalerts":
             await self._handle_sweepalerts(chat_id, parts)
-        elif command == "/contalerts":
-            await self._handle_contalerts(chat_id, parts)
         elif command in ("/sweeps", "/setups"):
             await self._handle_sweeps(chat_id)
         elif command == "/sweepcheck":
@@ -458,19 +456,6 @@ class TelegramBotService:
         status = "enabled ✅" if enabled else "disabled ❌"
         await self.send_message_to_user(chat_id, f"Daily Sweep alerts {status}.")
 
-    async def _handle_contalerts(self, chat_id: str, parts: list[str]) -> None:
-        if await self._sweep_unavailable(chat_id):
-            return
-        if len(parts) != 2 or parts[1].lower() not in ("on", "off"):
-            await self.send_message_to_user(
-                chat_id, "❌ Usage: <code>/contalerts on</code> or <code>/contalerts off</code>"
-            )
-            return
-        enabled = parts[1].lower() == "on"
-        await self.users_service.set_daily_continuation_alerts_enabled(chat_id, enabled)
-        status = "enabled ✅" if enabled else "disabled ❌"
-        await self.send_message_to_user(chat_id, f"Daily Continuation alerts {status}.")
-
     async def _handle_sweeps(self, chat_id: str) -> None:
         if await self._sweep_unavailable(chat_id):
             return
@@ -494,7 +479,7 @@ class TelegramBotService:
             return
         await self.send_message_to_user(
             chat_id,
-            "🔄 Daily setup scan started. Requests are spaced to respect the Twelve Data rate limit, "
+            "🔄 Daily Sweep scan started. Requests are spaced to respect the Twelve Data rate limit, "
             "so this takes a few minutes — I'll message you when it finishes.",
         )
         # A scan takes minutes; running it inline would block every other Telegram update
@@ -509,7 +494,7 @@ class TelegramBotService:
             logger.error(f"Manual Daily Sweep scan failed: {error}")
             await self.send_message_to_user(chat_id, f"❌ Daily Sweep scan failed: {html.escape(str(error))}")
             return
-        message = f"✅ <b>Daily setup scan finished</b>\n\n{html.escape(report.summary())}"
+        message = f"✅ <b>Daily Sweep scan finished</b>\n\n{html.escape(report.summary())}"
         if report.retry_pairs:
             message += f"\n\nNo usable data for: {', '.join(report.retry_pairs)}"
         await self.send_message_to_user(chat_id, message)
@@ -541,12 +526,8 @@ class TelegramBotService:
             "━━━━━━━━━━━━━━━━━━━━\n"
             "<b>📊 Daily Sweep</b>\n\n"
             "<code>/sweepalerts [on|off]</code> — Daily Sweep notifications\n"
-            "<code>/sweeps</code> (or <code>/setups</code>) — all active setups\n"
+            "<code>/sweeps</code> (or <code>/setups</code>) — active setups\n"
             "<code>/sweepcheck [PAIR]</code> — last two daily candles + setup check\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>📈 Daily Continuation</b>\n\n"
-            "<code>/contalerts [on|off]</code> — continuation notifications (separate from sweeps)\n"
-            "Same scan, same <code>/sweeps</code> and <code>/sweepcheck</code> commands\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "🔴 SL · 🟢 TP · 🎯 TARGET\n"
             "Real-time price alerts via live feed ⚡"
@@ -559,7 +540,7 @@ class TelegramBotService:
                 "<code>/gencode [N]</code> — generate invite codes\n"
                 "<code>/listcodes</code> — view all codes\n"
                 "<code>/revokecode [CODE]</code> — delete a code\n"
-                "<code>/sweepscan</code> — run the Daily Sweep + Continuation scan now"
+                "<code>/sweepscan</code> — run the Daily Sweep scan now"
             )
 
         await self.send_message_to_user(chat_id, msg)

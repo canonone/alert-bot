@@ -411,9 +411,9 @@ class _FakeResult:
 
 
 class _FakeSession:
-    """Stands in for the atomic stage claim. The shared `db` dict is the setup row
-    ({"status", optional "stage" (default 0), optional "expires_at"}); the UPDATE is read from the
-    statement's bind params, so only a caller whose from-stage matches the row's gets rowcount 1."""
+    """Stands in for the atomic ACTIVE -> TRIGGERED claim. The shared `db` dict is the setup row
+    ({"status", optional "expires_at"}); the UPDATE's WHERE values are read from the statement's bind
+    params, so only a caller that finds the row still ACTIVE and not past expiry gets rowcount 1."""
 
     def __init__(self, db):
         self.db = db
@@ -430,9 +430,9 @@ class _FakeSession:
         await asyncio.sleep(0)  # a real round trip yields to the event loop
         p, db = stmt.compile().params, self.db
         not_expired = db.get("expires_at") is None or db["expires_at"] > p["day3_expires_at_1"]
-        if db["status"] == "ACTIVE" and db.get("stage", 0) == p["stage_1"] and not_expired:
-            db["stage"], db["status"] = p["stage"], p["status"]
-            db.setdefault("claims", []).append((p["stage_1"], p["stage"]))
+        if db["status"] == p["status_1"] and not_expired:
+            db["status"] = p["status"]
+            db.setdefault("claims", []).append(p["trigger_price"])
             return _FakeResult(1)
         return _FakeResult(0)
 
@@ -444,7 +444,7 @@ def _new_service(monkeypatch=None, db=None):
     svc = DailySweepService(api_key="k", market_data=None, users_service=None, send_message=None)
     sent = []
 
-    async def fake_broadcast(message, kind="SWEEP"):
+    async def fake_broadcast(message):
         sent.append(message)
 
     svc._broadcast = fake_broadcast
@@ -708,24 +708,17 @@ def test_normal_tick_trigger_has_no_extra_line(monkeypatch):
 
 
 class _User:
-    def __init__(self, chat_id, sweeps=False, continuations=False):
+    def __init__(self, chat_id, sweeps=False):
         self.chat_id = chat_id
         self.daily_sweep_alerts_enabled = sweeps
-        self.daily_continuation_alerts_enabled = continuations
 
 
 class _FakeUsers:
     def __init__(self, users):
         self.users = users
 
-    async def find_digest_subscribers(self):
-        return [u for u in self.users if u.daily_sweep_alerts_enabled or u.daily_continuation_alerts_enabled]
-
     async def find_daily_sweep_subscribers(self):
         return [u for u in self.users if u.daily_sweep_alerts_enabled]
-
-    async def find_daily_continuation_subscribers(self):
-        return [u for u in self.users if u.daily_continuation_alerts_enabled]
 
 
 def test_run_scan_sends_digest_then_pre_armed_hit(monkeypatch):
@@ -737,12 +730,6 @@ def test_run_scan_sends_digest_then_pre_armed_hit(monkeypatch):
     svc.pairs = ["EURUSD"]
     svc.get_last_price = lambda symbol: (1.0860, svc.clock())
     monkeypatch.setattr(sweep_module, "SCAN_REQUEST_SPACING_SECONDS", 0)
-    svc.users_service = _FakeUsers([_User("1", sweeps=True)])
-
-    async def send(chat_id, message):  # the digest goes out per user, straight to the chat
-        sent.append(message)
-
-    svc.send_message = send
 
     setup = _armed_setup(SELL, 1.0850)
 
@@ -758,7 +745,127 @@ def test_run_scan_sends_digest_then_pre_armed_hit(monkeypatch):
     svc._record_scan = noop
     asyncio.run(svc.run_scan())
     assert len(sent) == 2
-    assert "Daily Setups" in sent[0] and "LEVEL HIT" in sent[1] and EXTRA_LINE in sent[1]
+    assert "Daily Sweep — New Setups" in sent[0] and "LEVEL HIT" in sent[1] and EXTRA_LINE in sent[1]
+
+
+def test_digest_layout():
+    setup = SetupState(
+        id=1, pair="XAUUSD", direction=SELL, day1=(4017.30, 4065.10, 3989.20, 4060.12),
+        day2=(4060.12, 4071.40, 4028.50, 4045.51), level=4060.12, day2_date=D(2026, 10, 27),
+        day3_expires_at=utc(2026, 10, 28, 21),
+    )
+    buy = SetupState(
+        id=2, pair="EURUSD", direction=BUY, day1=(1, 2, 0, 1), day2=(1.0, 1.2, 1.0812, 1.1),
+        level=1.0845, day2_date=D(2026, 10, 27), day3_expires_at=utc(2026, 10, 28, 21),
+    )
+    assert sweep_module.format_new_setups_digest([setup, buy]) == (
+        "🗓 <b>Daily Sweep — New Setups</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🔻 <b>XAUUSD</b> SELL @ 4,060.12\n"
+        "   Day 2 high (sweep): 4,071.40\n"
+        "🔺 <b>EURUSD</b> BUY @ 1.08450\n"
+        "   Day 2 low (sweep): 1.08120\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "⏳ Valid until Day 3 close: 2026-10-28 22:00 WAT"
+    )
+
+
+def test_digest_and_hits_go_only_to_sweepalerts_subscribers():
+    import asyncio
+
+    svc = DailySweepService("k", None, None, None)
+    sent = []
+
+    async def send(chat_id, message):
+        sent.append(chat_id)
+
+    svc.send_message = send
+    svc.users_service = _FakeUsers([_User("on", sweeps=True), _User("off", sweeps=False)])
+    asyncio.run(svc._broadcast("anything"))
+    assert sent == ["on"]
+
+
+# ── Atomic claim: ACTIVE -> TRIGGERED once, never after expiry ──────────────
+
+def _claim_setup(expires=None):
+    return _armed_setup(SELL, 1.0850) if expires is None else SetupState(
+        id=1, pair="EURUSD", direction=SELL, day1=(1, 2, 0, 1), day2=(1, 2, 0, 1), level=1.0850,
+        day2_date=D(2026, 10, 28), day3_expires_at=expires,
+    )
+
+
+def test_duplicate_ticks_send_the_alert_once(monkeypatch):
+    import asyncio
+
+    db = {"status": "ACTIVE", "expires_at": utc(2026, 10, 29, 21)}
+    svc, sent = _new_service(monkeypatch, db)
+    svc._cache_add(_claim_setup())
+    svc.clock = lambda: utc(2026, 10, 29, 9)
+    for price in (1.0851, 1.0852, 1.0900):
+        asyncio.run(svc.check_tick("EURUSD", price, None))
+    assert len(sent) == 1 and db["claims"] == [1.0851] and db["status"] == "TRIGGERED"
+
+
+def test_concurrent_ticks_cannot_send_twice(monkeypatch):
+    import asyncio
+
+    db = {"status": "ACTIVE", "expires_at": utc(2026, 10, 29, 21)}
+    svc, sent = _new_service(monkeypatch, db)
+    svc._cache_add(_claim_setup())
+    svc.clock = lambda: utc(2026, 10, 29, 9)
+
+    async def storm():
+        await asyncio.gather(*(svc.check_tick("EURUSD", 1.0851, None) for _ in range(5)))
+
+    asyncio.run(storm())
+    assert len(sent) == 1 and len(db["claims"]) == 1
+
+
+def test_two_processes_with_the_same_cache_send_once(monkeypatch):
+    # e.g. an overlapping deploy: both instances loaded the setup and see the same tick; only the DB claim stands between them
+    import asyncio
+
+    db = {"status": "ACTIVE", "expires_at": utc(2026, 10, 29, 21)}
+    a, sent_a = _new_service(monkeypatch, db)
+    b, sent_b = _new_service(monkeypatch, db)
+    for svc in (a, b):
+        svc._cache_add(_claim_setup())
+        svc.clock = lambda: utc(2026, 10, 29, 9)
+
+    async def both():
+        await asyncio.gather(a.check_tick("EURUSD", 1.0851, None), b.check_tick("EURUSD", 1.0851, None))
+
+    asyncio.run(both())
+    assert len(sent_a) + len(sent_b) == 1 and len(db["claims"]) == 1
+
+
+def test_claim_is_refused_after_expiry(monkeypatch):
+    import asyncio
+
+    expires = utc(2026, 10, 29, 21)
+    db = {"status": "ACTIVE", "expires_at": expires}
+    svc, sent = _new_service(monkeypatch, db)
+    setup = _claim_setup(expires)
+    svc._cache_add(setup)
+    asyncio.run(svc._trigger(setup, 1.0900, expires))  # exactly at expiry: not "> now"
+    asyncio.run(svc._trigger(setup, 1.0900, expires + datetime.timedelta(seconds=1)))
+    assert sent == [] and db["status"] == "ACTIVE"
+
+
+def test_database_error_keeps_the_setup_armed_and_sends_nothing(monkeypatch):
+    import asyncio
+
+    db = {"status": "ACTIVE", "expires_at": utc(2026, 10, 29, 21)}
+    svc, sent = _new_service(monkeypatch, db)
+    setup = _claim_setup()
+    svc._cache_add(setup)
+    svc.clock = lambda: utc(2026, 10, 29, 9)
+    monkeypatch.setattr(sweep_module, "SessionLocal", lambda: (_ for _ in ()).throw(RuntimeError("db down")))
+    asyncio.run(svc.check_tick("EURUSD", 1.0900, None))
+    assert sent == [] and svc.active_symbols() == {"EURUSD"}
+    monkeypatch.setattr(sweep_module, "SessionLocal", lambda: _FakeSession(db))
+    asyncio.run(svc.check_tick("EURUSD", 1.0900, None))  # DB is back -> retried on the next tick
+    assert len(sent) == 1
 
 
 # ── Startup catch-up decision ───────────────────────────────────────────────

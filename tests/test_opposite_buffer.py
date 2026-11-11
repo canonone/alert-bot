@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 import app.services.daily_sweep_service as sm
-from app.services.daily_sweep_service import BUY, SELL, DailySweepService, classify_continuation, detect_continuation, detect_sweep
+from app.services.daily_sweep_service import BUY, SELL, DailySweepService, detect_sweep
 
 from test_daily_sweep import D, _FakeMarketData, candle, day_hours, ny
 
@@ -28,7 +28,6 @@ def c(day, ohlc):
 def test_audusd_no_setup_fails_both_the_sweep_margin_and_the_buffer():
     d1, d2 = c(MON, AUDUSD_D1), c(TUE, AUDUSD_D2)
     assert detect_sweep(d1, d2, "AUDUSD") is None
-    assert detect_continuation(d1, d2, "AUDUSD") is None
     heading, *failed = sm.explain_no_setup(d1, d2, "AUDUSD")
     assert heading == "BUY sweep (Day 1 closed bearish):"
     assert failed == [
@@ -65,7 +64,6 @@ def test_audcad_is_still_a_sweep_buy():
     assert signal.level == 0.98322 and signal.sweep_extreme == 0.98240
     assert (d1.high - d2.high) / 0.0001 == pytest.approx(5.2)  # beyond the 2-pip buffer
     assert (d1.low - d2.low) / 0.0001 == pytest.approx(7.2)  # beyond the 3-pip sweep margin
-    assert detect_continuation(d1, d2, "AUDCAD") is None  # Day 2 is bullish after a bearish Day 1
 
 
 # ── The boundary: exactly 2.0 pips is "not taken", 1.9 is "taken" ───────────
@@ -86,22 +84,6 @@ def test_sweep_buy_boundary_on_the_high():
     assert detect_sweep(d1, d2(1.1045), FX).direction == BUY
 
 
-def test_continuation_buy_boundary_on_the_low():
-    d1 = c(MON, (1.1000, 1.1050, 1.0950, 1.1040))
-    d2 = lambda low: c(TUE, (1.1040, 1.1090, low, 1.1060))  # noqa: E731
-    assert detect_continuation(d1, d2(1.0952), FX).direction == BUY  # exactly 2.0
-    assert classify_continuation(d1, d2(1.09519), FX) == sm.SKIP_OPPOSITE  # 1.9
-    assert classify_continuation(d1, d2(1.0950), FX) == sm.SKIP_OPPOSITE  # equal
-
-
-def test_continuation_sell_boundary_on_the_high():
-    d1 = c(MON, (1.1040, 1.1050, 1.0950, 1.1000))
-    d2 = lambda high: c(TUE, (1.1000, high, 1.0900, 1.0940))  # noqa: E731
-    assert detect_continuation(d1, d2(1.1048), FX).direction == SELL  # exactly 2.0 below Day 1's high
-    assert classify_continuation(d1, d2(1.10481), FX) == sm.SKIP_OPPOSITE  # 1.9
-    assert classify_continuation(d1, d2(1.1050), FX) == sm.SKIP_OPPOSITE
-
-
 # ── Wording ─────────────────────────────────────────────────────────────────
 
 def test_wording_for_within_touched_and_beyond():
@@ -120,21 +102,21 @@ def test_wording_for_within_touched_and_beyond():
 
 def test_buffer_uses_the_pairs_pip_size():
     jpy = c(MON, (110.00, 110.50, 109.50, 110.40))
-    d2 = lambda low: c(TUE, (110.40, 111.00, low, 110.60))  # noqa: E731
-    assert detect_continuation(jpy, d2(109.52), "AUDJPY") is not None  # 2 pips (0.02) clear
-    assert classify_continuation(jpy, d2(109.51), "AUDJPY") == sm.SKIP_OPPOSITE  # 1 pip
+    d2 = lambda low: c(TUE, (110.40, 110.60, low, 110.20))  # noqa: E731
+    assert detect_sweep(jpy, d2(109.52), "AUDJPY") is not None  # 2 pips (0.02) clear of Day 1's low
+    assert detect_sweep(jpy, d2(109.51), "AUDJPY") is None  # 1 pip
     gold = c(MON, (4000.0, 4050.0, 3980.0, 4040.0))
-    g2 = lambda low: c(TUE, (4040.0, 4100.0, low, 4060.0))  # noqa: E731
-    assert detect_continuation(gold, g2(3980.2), "XAUUSD") is not None  # 2 pips = 0.2
-    assert classify_continuation(gold, g2(3980.1), "XAUUSD") == sm.SKIP_OPPOSITE
+    g2 = lambda low: c(TUE, (4040.0, 4060.0, low, 4000.0))  # noqa: E731
+    assert detect_sweep(gold, g2(3980.2), "XAUUSD") is not None  # 2 pips = 0.2
+    assert detect_sweep(gold, g2(3980.1), "XAUUSD") is None
 
 
 def test_buffer_is_a_per_pair_setting(monkeypatch):
-    d1 = c(MON, (1.1000, 1.1050, 1.0950, 1.1040))
-    d2 = c(TUE, (1.1040, 1.1090, 1.0953, 1.1060))  # 3 pips clear
-    assert detect_continuation(d1, d2, FX) is not None
+    d1 = c(MON, (1.1000, 1.1050, 1.0950, 1.1030))
+    d2 = c(TUE, (1.1030, 1.1060, 1.0953, 1.1000))  # low 3 pips clear
+    assert detect_sweep(d1, d2, FX) is not None
     monkeypatch.setitem(sm.PAIR_OPPOSITE_SIDE_BUFFER_PIPS, FX, 5.0)
-    assert classify_continuation(d1, d2, FX) == sm.SKIP_OPPOSITE
-    assert detect_continuation(d1, d2, "GBPUSD") is not None  # other pairs keep the default 2
+    assert detect_sweep(d1, d2, FX) is None
+    assert detect_sweep(d1, d2, "GBPUSD") is not None  # other pairs keep the default 2
     monkeypatch.setitem(sm.PAIR_OPPOSITE_SIDE_BUFFER_PIPS, FX, 0.0)
-    assert detect_continuation(d1, c(TUE, (1.1040, 1.1090, 1.09501, 1.1060)), FX) is not None  # buffer 0: any clearance
+    assert detect_sweep(d1, c(TUE, (1.1030, 1.1060, 1.09501, 1.1000)), FX) is not None  # buffer 0: any clearance
