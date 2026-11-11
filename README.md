@@ -80,10 +80,9 @@ Tables are created automatically on first run.
 | `/price [PAIR]` | Get live price |
 | `/pairs` | List supported pairs |
 | `/sweepalerts [on\|off]` | Opt in/out of Daily Sweep notifications |
-| `/contalerts [on\|off]` | Opt in/out of Daily Continuation notifications (separate from sweeps) |
-| `/sweeps` (or `/setups`) | List all active setups — sweeps and continuations (pair, direction, level(s), which continuation level is hit, expiry in WAT) |
-| `/sweepcheck [PAIR]` | Show the last two completed daily candles as the bot built them, and whether they form a sweep or continuation setup |
-| `/sweepscan` | Admin only: run the daily scan (both features) now |
+| `/sweeps` (or `/setups`) | List active Daily Sweep setups (pair, direction, level, expiry in WAT) |
+| `/sweepcheck [PAIR]` | Show the last two completed daily candles as the bot built them, and whether they form a sweep setup |
+| `/sweepscan` | Admin only: run the Daily Sweep scan now |
 | `/help` | Full command list |
 
 ### Alert Types
@@ -107,30 +106,6 @@ these comparisons — see *Margins and settings*):
 If the level isn't reached by the time Day 3 closes, the setup expires silently. Each setup fires
 at most once.
 
-### Daily Continuation Alerts
-Runs on the same candles, scan, tick feed and storage as Daily Sweep — each pair is fetched once
-per scan and checked for both patterns. Opt in with `/contalerts on` (independent of
-`/sweepalerts`). Day 2 must be fully closed; all comparisons are strict.
-
-- **BUY** — Day 1 and Day 2 both close bullish, Day 2 closes above Day 1's high, Day 2's low >
-  Day 1's low (it didn't take the low), and Day 2 opened below Day 1's high (no gap — see the note
-  below: with open = previous close this can effectively never trigger, but the rule is kept).
-  Level 1 = Day 1's high, Level 2 = Day 2's open (always below Level 1).
-- **SELL** — the mirror: both bearish, Day 2 closes below Day 1's low, Day 2's high < Day 1's
-  high, Day 2 opened above Day 1's low. Level 1 = Day 1's low, Level 2 = Day 2's open.
-
-During Day 3 the levels fire in order: Level 1 first (price pulls back to the broken extreme),
-then Level 2. A price already past both fires one combined message. Each stage is claimed with an
-atomic database update, so it can never be sent twice. At Day 3's close the setup expires silently,
-whether nothing or only Level 1 was hit. The suggested stop is Day 2's low (BUY) / high (SELL).
-A Day 2 can match only one of the four patterns (the Day 1/Day 2 colour combination decides it).
-
-Because a day's open is the previous day's close, Day 2 always opens at Day 1's close, so a gap
-between Day 1 and Day 2 can no longer occur and the "no gap" skip effectively never fires (only if
-Day 1 closed exactly on its own high/low, or when an open fell back to the first bar). The code is
-kept as a harmless guard. `/sweepcheck` shows `open = previous close` per candle, and both values
-when the first 1H bar's open differs by more than 2 pips.
-
 ### Margins and settings
 Small feed differences between Twelve Data and FOREX.com shouldn't create or break a setup, so the
 patterns carry minimum margins. A pip is 0.0001 (0.01 for JPY pairs, 0.1 for XAUUSD). Each setting is
@@ -138,16 +113,15 @@ a default constant in `app/services/daily_sweep_service.py` with a per-pair over
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `MIN_BEYOND_PIPS` (`PAIR_MIN_BEYOND_PIPS`) | 3 | A continuation's Day 2 **close** must be at least this far beyond Day 1's high (BUY) / low (SELL); a sweep's Day 2 **wick** must go at least this far beyond Day 1's high (SELL) / low (BUY). |
-| `OPPOSITE_SIDE_BUFFER_PIPS` (`PAIR_OPPOSITE_SIDE_BUFFER_PIPS`) | 2 | Day 2 only counts as *not having taken* Day 1's opposite extreme if it stayed at least this many pips away from it (sweep SELL: low ≥ Day 1 low + buffer; sweep BUY: high ≤ Day 1 high − buffer; continuation BUY: low ≥ Day 1 low + buffer; continuation SELL: high ≤ Day 1 high − buffer). Twelve Data's extremes can sit a fraction of a pip inside FOREX.com's, so a near-touch counts as a touch. Exactly the buffer counts as clear; anything closer is taken. |
-| `MIN_BODY_PIPS` (`PAIR_MIN_BODY_PIPS`) | 2 | A day is only bullish/bearish if `|close − open|` is at least this. Anything smaller is a doji and matches neither pattern. |
-| `MERGE_LEVELS_PIPS` (`PAIR_MERGE_LEVELS_PIPS`) | 3 | When a continuation's Level 1 and Level 2 are within this many pips, they are one zone: ONE combined alert when Level 1 is reached (with a note that the levels are only X pips apart), and the setup is complete. `/sweepcheck`, `/sweeps` and the digest show "single alert (levels X pips apart)". |
+| `MIN_BEYOND_PIPS` (`PAIR_MIN_BEYOND_PIPS`) | 3 | A sweep's Day 2 **wick** must go at least this far beyond Day 1's high (SELL) / low (BUY). |
+| `OPPOSITE_SIDE_BUFFER_PIPS` (`PAIR_OPPOSITE_SIDE_BUFFER_PIPS`) | 2 | Day 2 only counts as *not having taken* Day 1's opposite extreme if it stayed at least this many pips away from it (SELL: Day 2 low ≥ Day 1 low + buffer; BUY: Day 2 high ≤ Day 1 high − buffer). Twelve Data's extremes can sit a fraction of a pip inside FOREX.com's, so a near-touch counts as a touch. Exactly the buffer counts as clear; anything closer is taken. |
+| `MIN_BODY_PIPS` (`PAIR_MIN_BODY_PIPS`) | 2 | A day is only bullish/bearish if `|close − open|` is at least this. Anything smaller is a doji and matches neither direction. |
 
 `/sweepcheck` lists every failed check with the numbers, e.g.
-`✗ needs Day 2 to close ≥3 pips above Day 1's high — but it closed 0.1 pips above (112.408 vs 112.407)`
+`✗ needs Day 2 to sweep Day 1's low by ≥3 pips — but its low went only 2.8 pips below Day 1's low (0.70101 vs 0.70129)`,
 `✗ needs Day 2 to stay ≥2 pips below Day 1's high — but it came within 0.2 pips (0.70403 vs 0.70405)`
-and `✗ Day 2 is a doji (body 1.1 pips < 2)`. Whether levels are merged is decided from the stored
-levels and the current setting, so changing `MERGE_LEVELS_PIPS` also applies to setups already armed.
+and `✗ Day 2 is a doji (body 1.1 pips < 2)`. It also shows `open = previous close` per candle (both
+values when the first 1H bar's open differs by more than 2 pips).
 
 **Daily candles.** A trading day runs 17:00 → 17:00 `America/New_York` (matching FOREX.com on
 TradingView), built by aggregating Twelve Data 1H bars — Twelve Data's own `1day` candles use
@@ -193,6 +167,22 @@ After upgrading from a version with the 4H zone feature, run this once to clean 
 ```sql
 DROP TABLE IF EXISTS retracement_zones;
 ALTER TABLE users DROP COLUMN IF EXISTS zone_alerts_enabled;
+```
+
+**After deploying the version that retired the two-level alert feature**, run this once on production,
+in this order (the app no longer reads these rows or columns, and never drops anything itself). Run it
+right after the deploy: until step 1 has run, that feature's leftover active rows would be read as
+ordinary sweep setups. Re-running it fails at step 1 because the column is already gone, which is harmless.
+
+```sql
+-- 1. Delete the retired feature's setups
+DELETE FROM daily_sweep_setups WHERE kind = 'CONTINUATION';
+
+-- 2. Drop the retired columns
+ALTER TABLE daily_sweep_setups DROP COLUMN IF EXISTS kind;
+ALTER TABLE daily_sweep_setups DROP COLUMN IF EXISTS level2;
+ALTER TABLE daily_sweep_setups DROP COLUMN IF EXISTS stage;
+ALTER TABLE users DROP COLUMN IF EXISTS daily_continuation_alerts_enabled;
 ```
 
 ## Tests
