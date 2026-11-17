@@ -431,8 +431,13 @@ class _FakeSession:
         p, db = stmt.compile().params, self.db
         not_expired = db.get("expires_at") is None or db["expires_at"] > p["day3_expires_at_1"]
         if db["status"] == "ACTIVE" and db.get("stage", 0) == p["stage_1"] and not_expired:
-            db["stage"], db["status"] = p["stage"], p["status"]
-            db.setdefault("claims", []).append((p["stage_1"], p["stage"]))
+            if "stage" in p:  # a trigger: moves the stage forward
+                db["stage"] = p["stage"]
+                db.setdefault("claims", []).append((p["stage_1"], p["stage"]))
+            else:  # an invalidation: status only
+                db["invalidated_price"] = p["invalidated_price"]
+                db.setdefault("claims", []).append((p["stage_1"], p["status"]))
+            db["status"] = p["status"]
             return _FakeResult(1)
         return _FakeResult(0)
 
@@ -561,6 +566,9 @@ class _FakeMarketData:
 
     async def get_candles(self, pair, interval, api_key, outputsize=2):
         return self.bars, False
+
+    async def get_current_price(self, symbol, api_key):
+        return None, False  # no price available: the scan-time sweep check then arms the setup as normal
 
 
 def _forming_wed_scenario():

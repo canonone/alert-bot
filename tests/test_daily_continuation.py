@@ -191,6 +191,7 @@ def _weekend_bars():
 
 
 def test_A_weekend_buy_continuation_ticks_and_silent_expiry(monkeypatch):
+    monkeypatch.setattr(sm, "SCAN_REQUEST_SPACING_SECONDS", 0)
     bars = day_hours(FRI, *FRI_C) + _weekend_bars() + day_hours(MON, *MON_C)
     now = ny(2026, 10, 26, 17, 10)
     db = {"status": "ACTIVE", "stage": 0}
@@ -597,6 +598,11 @@ def test_sweeps_command_lists_both_kinds_with_stage():
         return states
 
     svc.list_active = fake_active
+
+    async def no_invalidated():
+        return []
+
+    svc.list_invalidated = no_invalidated
     text = asyncio.run(svc.get_sweeps_message())
     assert "🔁 SWEEP" in text and "XAUUSD" in text
     assert "📈 CONTINUATION" in text
@@ -632,6 +638,7 @@ def test_sweepcheck_reports_continuation_classification():
 # ── Shared machinery: one fetch per pair serves both features ───────────────
 
 def test_one_candle_fetch_per_pair_serves_both_features(monkeypatch):
+    monkeypatch.setattr(sm, "SCAN_REQUEST_SPACING_SECONDS", 0)
     class _Counting(_FakeMarketData):
         calls = 0
 

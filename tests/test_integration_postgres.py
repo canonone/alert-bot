@@ -145,6 +145,17 @@ def test_init_db_idempotent_on_empty_and_old_schema():
                 user = await session.get(User, "1")
             assert (row.kind, row.stage, row.level2) == ("SWEEP", 0, None)
             assert user.daily_sweep_alerts_enabled is False and user.daily_continuation_alerts_enabled is False
+            # The INVALIDATED status doesn't fit the original VARCHAR(10): init_db must have widened it (idempotently)
+            async with engine.connect() as conn:
+                width = (await conn.execute(text(
+                    "select character_maximum_length from information_schema.columns "
+                    "where table_schema = current_schema() and table_name = 'daily_sweep_setups' and column_name = 'status'"
+                ))).scalar_one()
+            assert width == 16
+            async with engine.begin() as conn:
+                await conn.execute(text("UPDATE daily_sweep_setups SET status = 'INVALIDATED'"))
+            async with Session() as session:
+                assert (await session.execute(select(DailySweepSetup))).scalar_one().status == "INVALIDATED"
 
     run(body)
 
@@ -351,5 +362,104 @@ def test_ticks_end_to_end_with_real_claims_and_two_instances():
             await asyncio.gather(a.check_tick("GBPJPY", 110.700, None), b.check_tick("GBPJPY", 110.700, None))
             assert len(sent_a) + len(sent_b) == 1
             assert (await _row(Session, other.id)).stage == 1
+
+    run(body)
+
+
+# ── Invalidation: the real SQL ──────────────────────────────────────────────
+
+SWEPT = 111.200  # above AUDJPY's Day 2 high 111.085 + the 2-pip buffer
+LEVEL_1 = 110.760
+
+
+def test_invalidation_claim_sql_lifecycle():
+    async def body():
+        async with pg() as (engine, Session):
+            svc, users, sent = _service()
+            async with Session() as session:
+                session.add_all([User(chat_id="cont", is_approved=True), User(chat_id="sweep", is_approved=True)])
+                await session.commit()
+            await users.set_daily_continuation_alerts_enabled("cont", True)
+            await users.set_daily_sweep_alerts_enabled("sweep", True)
+
+            voided = await svc._store_setup(*_cont_args("AUDJPY"))
+            started = await svc._store_setup(*_cont_args("GBPJPY"))
+            late = await svc._store_setup(*_cont_args("NZDJPY"))
+            sweep = await svc._store_setup(*_sweep_args())
+            await svc.bootstrap()
+            assert svc.active_symbols() == {"AUDJPY", "GBPJPY", "NZDJPY", "EURUSD"}
+
+            # A sweep of Day 2's high before Level 1: ACTIVE -> INVALIDATED, once, to /contalerts subscribers only
+            await svc.check_tick("AUDJPY", SWEPT, None)
+            row = await _row(Session, voided.id)
+            assert (row.status, row.stage, row.invalidated_price, row.invalidated_at) == ("INVALIDATED", 0, SWEPT, MID_DAY3)
+            assert (row.triggered_at, row.trigger_price) == (None, None)
+            assert [chat for chat, _ in sent] == ["cont"] and "SETUP INVALIDATED" in sent[0][1]
+            assert "AUDJPY" not in svc.active_symbols()
+            await svc.check_tick("AUDJPY", SWEPT, None)  # duplicate sweep tick
+            await svc.check_tick("AUDJPY", LEVEL_1, None)  # a later retrace: no alert
+            assert len(sent) == 1
+            assert await svc._claim_invalidation(voided, SWEPT, MID_DAY3) is False  # repeat: nothing to claim
+            assert await svc._claim_stage(voided, 0, 1, LEVEL_1, MID_DAY3) is False  # and no trigger either
+            assert (await _row(Session, voided.id)).status == "INVALIDATED"
+            assert await svc._store_setup(*_cont_args("AUDJPY")) is None  # the (pair, day2_date) row still blocks a re-create
+
+            # Level 1 first (stage 1): the sweep afterwards must not void it, in memory or in SQL
+            sent.clear()
+            await svc.check_tick("GBPJPY", LEVEL_1, None)
+            assert (await _row(Session, started.id)).stage == 1 and len(sent) == 1
+            await svc.check_tick("GBPJPY", SWEPT, None)
+            assert await svc._claim_invalidation(started, SWEPT, MID_DAY3) is False
+            row = await _row(Session, started.id)
+            assert (row.status, row.stage, row.invalidated_at) == ("ACTIVE", 1, None) and len(sent) == 1
+
+            # Never after expiry (exactly at it is not "> now" either)
+            expiry = late.day3_expires_at
+            assert await svc._claim_invalidation(late, SWEPT, expiry) is False
+            assert await svc._claim_invalidation(late, SWEPT, expiry + datetime.timedelta(seconds=1)) is False
+            assert (await _row(Session, late.id)).status == "ACTIVE"
+
+            # Never a sweep setup, even if something asked
+            assert await svc._claim_invalidation(sweep, 1e9, MID_DAY3) is False
+            assert (await _row(Session, sweep.id)).status == "ACTIVE"
+
+            # Reading it back: bootstrap skips INVALIDATED rows; /sweeps lists it apart; expiry leaves it alone
+            fresh, _, _ = _service()
+            await fresh.bootstrap()
+            assert fresh.active_symbols() == {"GBPJPY", "NZDJPY", "EURUSD"}
+            invalidated = await fresh.list_invalidated()
+            assert [(s.pair, price, at) for s, price, at in invalidated] == [("AUDJPY", SWEPT, MID_DAY3)]
+            assert "AUDJPY" in (await fresh.get_sweeps_message()).split("Invalidated")[1]
+            fresh.clock = lambda: expiry + datetime.timedelta(minutes=1)
+            await fresh.expire_setups()
+            assert (await _row(Session, voided.id)).status == "INVALIDATED"  # not rewritten to EXPIRED
+            assert (await _row(Session, late.id)).status == "EXPIRED"
+            assert await fresh.list_invalidated() == []  # gone from /sweeps once Day 3 has ended
+
+    run(body)
+
+
+def test_invalidation_vs_trigger_race_between_two_instances_has_exactly_one_outcome():
+    async def body():
+        async with pg() as (engine, Session):
+            svc, users, _ = _service()
+            async with Session() as session:
+                session.add(User(chat_id="cont", is_approved=True))
+                await session.commit()
+            await users.set_daily_continuation_alerts_enabled("cont", True)
+            for pair in ("AUDJPY", "GBPJPY", "NZDJPY", "CADJPY"):  # a few rounds: either order is valid, never both
+                setup = await svc._store_setup(*_cont_args(pair))
+                a, _, sent_a = _service()
+                b, _, sent_b = _service()
+                await a.bootstrap()
+                await b.bootstrap()
+                await asyncio.gather(a.check_tick(pair, SWEPT, None), b.check_tick(pair, LEVEL_1, None))
+                row = await _row(Session, setup.id)
+                messages = [m for _, m in sent_a + sent_b]
+                assert len(messages) == 1
+                if row.status == "INVALIDATED":
+                    assert row.stage == 0 and "SETUP INVALIDATED" in messages[0]
+                else:
+                    assert (row.status, row.stage) == ("ACTIVE", 1) and "LEVEL 1 HIT" in messages[0]
 
     run(body)
