@@ -81,7 +81,7 @@ Tables are created automatically on first run.
 | `/pairs` | List supported pairs |
 | `/sweepalerts [on\|off]` | Opt in/out of Daily Sweep notifications |
 | `/contalerts [on\|off]` | Opt in/out of Daily Continuation notifications (separate from sweeps) |
-| `/sweeps` (or `/setups`) | List all active setups — sweeps and continuations (pair, direction, level(s), which continuation level is hit, expiry in WAT) |
+| `/sweeps` (or `/setups`) | List all active setups — sweeps and continuations (pair, direction, level(s), which continuation level is hit, expiry in WAT; invalidated continuations are listed separately) |
 | `/sweepcheck [PAIR]` | Show the last two completed daily candles as the bot built them, and whether they form a sweep or continuation setup |
 | `/sweepscan` | Admin only: run the daily scan (both features) now |
 | `/help` | Full command list |
@@ -125,6 +125,20 @@ atomic database update, so it can never be sent twice. At Day 3's close the setu
 whether nothing or only Level 1 was hit. The suggested stop is Day 2's low (BUY) / high (SELL).
 A Day 2 can match only one of the four patterns (the Day 1/Day 2 colour combination decides it).
 
+**Invalidation (continuations only).** The pullback to the points of interest is only valid if price has
+not first swept Day 2's extreme. While a continuation is still at stage 0 (Level 1 not yet reached), if
+price trades beyond Day 2's **high** (BUY) or **low** (SELL) by *more than* `SWEEP_INVALIDATION_BUFFER_PIPS`
+(2 pips by default), the setup is marked `INVALIDATED`: a later retrace to Level 1 or Level 2 won't alert,
+and `/contalerts` subscribers get one short message with the swept level and the time in WAT. The check
+runs before any stage advancement, and the status change is an atomic database claim
+(`ACTIVE → INVALIDATED` only at stage 0 and before Day 3 closes), so restarts, duplicate ticks and a
+simultaneous Level 1 tick can't produce two outcomes. Once Level 1 has fired the rule no longer applies:
+Level 2 stays live. The same test runs when a setup is armed at the 17:10 scan: if the 1H bars since Day 2
+closed (including the in-progress 17:00 bar), or failing that the latest price, already swept Day 2's
+extreme, the setup is not created and the scan logs why. Sweep setups are never invalidated. Expiry stays
+silent. (The "invalidation / SL idea" line in the alerts is the trade's stop — Day 2's low for a BUY — which
+is the opposite extreme.)
+
 Because a day's open is the previous day's close, Day 2 always opens at Day 1's close, so a gap
 between Day 1 and Day 2 can no longer occur and the "no gap" skip effectively never fires (only if
 Day 1 closed exactly on its own high/low, or when an open fell back to the first bar). The code is
@@ -140,6 +154,7 @@ a default constant in `app/services/daily_sweep_service.py` with a per-pair over
 |---|---|---|
 | `MIN_BEYOND_PIPS` (`PAIR_MIN_BEYOND_PIPS`) | 3 | A continuation's Day 2 **close** must be at least this far beyond Day 1's high (BUY) / low (SELL); a sweep's Day 2 **wick** must go at least this far beyond Day 1's high (SELL) / low (BUY). |
 | `OPPOSITE_SIDE_BUFFER_PIPS` (`PAIR_OPPOSITE_SIDE_BUFFER_PIPS`) | 2 | Day 2 only counts as *not having taken* Day 1's opposite extreme if it stayed at least this many pips away from it (sweep SELL: low ≥ Day 1 low + buffer; sweep BUY: high ≤ Day 1 high − buffer; continuation BUY: low ≥ Day 1 low + buffer; continuation SELL: high ≤ Day 1 high − buffer). Twelve Data's extremes can sit a fraction of a pip inside FOREX.com's, so a near-touch counts as a touch. Exactly the buffer counts as clear; anything closer is taken. |
+| `SWEEP_INVALIDATION_BUFFER_PIPS` (`PAIR_SWEEP_INVALIDATION_BUFFER_PIPS`) | 2 | Continuations only: price must exceed Day 2's high (BUY) / low (SELL) by MORE than this many pips, before Level 1, to void the setup. Exactly the buffer does not count. |
 | `MIN_BODY_PIPS` (`PAIR_MIN_BODY_PIPS`) | 2 | A day is only bullish/bearish if `|close − open|` is at least this. Anything smaller is a doji and matches neither pattern. |
 | `MERGE_LEVELS_PIPS` (`PAIR_MERGE_LEVELS_PIPS`) | 3 | When a continuation's Level 1 and Level 2 are within this many pips, they are one zone: ONE combined alert when Level 1 is reached (with a note that the levels are only X pips apart), and the setup is complete. `/sweepcheck`, `/sweeps` and the digest show "single alert (levels X pips apart)". |
 
@@ -187,7 +202,10 @@ inherits that difference. High, low and close can also be a few pips off (typica
 ## Upgrading
 
 The app creates missing tables on startup (so `daily_sweep_setups` appears automatically) and adds
-the `users.daily_sweep_alerts_enabled` column if it's missing. Nothing is ever dropped at runtime.
+the `users.daily_sweep_alerts_enabled` column if it's missing. It also adds the continuation columns
+(including `invalidated_at` / `invalidated_price`) and widens `daily_sweep_setups.status` from `VARCHAR(10)` to
+`VARCHAR(16)` so the `INVALIDATED` status fits (a no-rewrite change). All of this is idempotent and happens
+on startup; nothing is ever dropped at runtime, and there is no manual SQL for this upgrade.
 After upgrading from a version with the 4H zone feature, run this once to clean up the old schema:
 
 ```sql
