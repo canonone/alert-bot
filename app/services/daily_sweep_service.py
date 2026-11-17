@@ -811,6 +811,9 @@ def format_level_hit(
 
 
 def format_invalidation(setup: SetupState, price: float, now_utc: datetime.datetime) -> str:
+    """`now_utc` is when the sweep was DETECTED, not necessarily when it happened: after a restart, or when a setup
+    is armed late, price may already have swept Day 2's extreme earlier, and the code can't tell. So the message
+    says "detected", never "swept at"."""
     pair = setup.pair
     side = "high" if setup.direction == BUY else "low"
     return (
@@ -818,8 +821,8 @@ def format_invalidation(setup: SetupState, price: float, now_utc: datetime.datet
         f"Setup invalidated: price swept Day 2's {side} before reaching the points of interest.\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"📍 <b>Day 2 {side.capitalize()} (swept):</b> {format_price(pair, setup.invalidation_extreme)}\n"
-        f"💰 <b>Price:</b> {format_price(pair, price)}\n"
-        f"🕐 <b>Time:</b> {_wat_str(now_utc)}\n"
+        f"💰 <b>Price when detected:</b> {format_price(pair, price)}\n"
+        f"🕐 <b>Detected at:</b> {_wat_str(now_utc)}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "This setup will not alert any more."
     )
@@ -1448,24 +1451,12 @@ class DailySweepService:
             )
             return [SetupState.from_model(row) for row in result.scalars().all()]
 
-    async def list_invalidated(self) -> list[tuple[SetupState, float | None, datetime.datetime | None]]:
-        """Continuations voided during the Day 3 that is still running: (setup, sweeping price, when)."""
-        now = self.clock()
-        async with SessionLocal() as session:
-            result = await session.execute(
-                select(DailySweepSetup)
-                .where(DailySweepSetup.status == INVALIDATED, DailySweepSetup.day3_expires_at > now)
-                .order_by(DailySweepSetup.invalidated_at, DailySweepSetup.pair)
-            )
-            return [(SetupState.from_model(r), r.invalidated_price, r.invalidated_at) for r in result.scalars().all()]
-
     async def get_sweeps_message(self) -> str:
+        # Only ACTIVE setups are listed: an invalidated one simply disappears (its row stays for audit)
         setups = await self.list_active()
-        invalidated = await self.list_invalidated()
-        if not setups and not invalidated:
+        if not setups:
             return "🗓 <b>Daily Setups</b>\n\nNo active setups right now."
-        lines = ["🗓 <b>Daily Setups — Active</b>" if setups else "🗓 <b>Daily Setups</b>\n\nNo active setups right now.",
-                 "━━━━━━━━━━━━━━━━━━━━"]
+        lines = ["🗓 <b>Daily Setups — Active</b>", "━━━━━━━━━━━━━━━━━━━━"]
         for s in setups:
             emoji = "🔻" if s.direction == SELL else "🔺"
             if s.kind == CONTINUATION_KIND:
@@ -1479,7 +1470,7 @@ class DailySweepService:
                     + (f"   single alert (levels {s.levels_apart_pips:.1f} pips apart)\n" if s.merged else "")
                     + (
                         f"   ⚠️ Voided if price trades beyond {format_price(s.pair, s.invalidation_price)} "
-                        f"(Day 2 {'high' if s.direction == BUY else 'low'} + "
+                        f"(Day 2 {'high +' if s.direction == BUY else 'low −'} "
                         f"{sweep_invalidation_buffer_pips_for(s.pair):g} pips) before ①\n"
                         if s.stage == 0 else ""
                     )
@@ -1490,19 +1481,6 @@ class DailySweepService:
                     f"🔁 SWEEP {emoji} <b>{s.pair}</b> {s.direction} @ {format_price(s.pair, s.level)}\n"
                     f"   Expires: {_wat_str(s.day3_expires_at)}"
                 )
-        if invalidated:
-            if setups:
-                lines.append("")
-            lines.append("🚫 <b>Invalidated</b> (no longer alerting)")
-            for s, swept_price, swept_at in invalidated:
-                emoji = "🔻" if s.direction == SELL else "🔺"
-                side = "high" if s.direction == BUY else "low"
-                detail = f"swept Day 2 {side} {format_price(s.pair, s.invalidation_extreme)}"
-                if swept_price is not None:
-                    detail += f" @ {format_price(s.pair, swept_price)}"
-                if swept_at is not None:
-                    detail += f" · {_wat_str(swept_at)}"
-                lines.append(f"📈 CONTINUATION {emoji} <b>{s.pair}</b> {s.direction} — {detail}")
         lines.append("━━━━━━━━━━━━━━━━━━━━")
         return "\n".join(lines)
 

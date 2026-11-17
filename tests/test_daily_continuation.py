@@ -598,11 +598,6 @@ def test_sweeps_command_lists_both_kinds_with_stage():
         return states
 
     svc.list_active = fake_active
-
-    async def no_invalidated():
-        return []
-
-    svc.list_invalidated = no_invalidated
     text = asyncio.run(svc.get_sweeps_message())
     assert "🔁 SWEEP" in text and "XAUUSD" in text
     assert "📈 CONTINUATION" in text

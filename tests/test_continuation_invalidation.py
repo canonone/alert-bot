@@ -238,7 +238,10 @@ def test_invalidation_message(direction):
     assert f"SETUP INVALIDATED — AUDJPY ({direction})" in text
     assert f"Setup invalidated: price swept Day 2's {side} before reaching the points of interest" in text
     assert f"Day 2 {label} (swept):</b> {state.invalidation_extreme:.3f}" in text
-    assert f"<b>Price:</b> {f(SWEEP):.3f}" in text and "2026-10-28 09:14 WAT" in text
+    # The time is when the sweep was DETECTED (after a restart it may have happened earlier), never "swept at"
+    assert f"<b>Price when detected:</b> {f(SWEEP):.3f}" in text
+    assert "<b>Detected at:</b> 2026-10-28 09:14 WAT" in text
+    assert "Time:" not in text and "swept at" not in text.lower()
     assert "<" not in text.replace("<b>", "").replace("</b>", "")  # valid Telegram HTML
 
 
@@ -402,54 +405,37 @@ def test_late_arming_reached_before_armed_is_unchanged_without_a_sweep():
     assert db["stage"] == 1 and db["status"] == "ACTIVE"
 
 
-# ── /sweeps display ─────────────────────────────────────────────────────────
+# ── /sweeps display: only ACTIVE setups ─────────────────────────────────────
 
-def test_sweeps_shows_invalidated_setups_apart_from_active_ones():
-    active, _ = case(BUY)
-    started, _ = case(BUY)
-    started.stage, started.id = 1, 2
+def test_sweeps_lists_only_active_setups_with_the_right_threshold_labels():
+    buy, _ = case(BUY)
     sell, _ = case(SELL)
-    sell.id = 3
+    sell.id = 2
+    started, _ = case(BUY)
+    started.stage, started.id = 1, 3
     svc = DailySweepService("k", None, None, None)
 
     async def active_list():
-        return [active, started]
+        return [buy, sell, started]
 
-    async def invalidated_list():
-        return [(sell, K - SWEEP, utc(2026, 10, 28, 8, 14))]
-
-    svc.list_active, svc.list_invalidated = active_list, invalidated_list
+    svc.list_active = active_list
     text = asyncio.run(svc.get_sweeps_message())
-    active_part, invalidated_part = text.split("🚫 <b>Invalidated</b>")
-    assert "⚠️ Voided if price trades beyond 111.105 (Day 2 high + 2 pips) before ①" in active_part
-    assert active_part.count("Voided if price") == 1  # not shown once Level 1 has fired (stage 1)
-    assert "AUDJPY" not in active_part.split("Voided")[0].split("Daily Setups — Active")[0]  # sanity: header only
-    assert "📈 CONTINUATION 🔻 <b>AUDJPY</b> SELL — swept Day 2 low 108.915 @ 108.890 · 2026-10-28 09:14 WAT" in invalidated_part
-    assert "Invalidated</b> (no longer alerting)" in text
+    # BUY: Day 2 high + buffer; SELL: Day 2 low MINUS buffer
+    assert "⚠️ Voided if price trades beyond 111.105 (Day 2 high + 2 pips) before ①" in text
+    assert "⚠️ Voided if price trades beyond 108.895 (Day 2 low − 2 pips) before ①" in text
+    assert "low + 2 pips" not in text and "high − 2 pips" not in text
+    assert text.count("Voided if price") == 2  # not shown once Level 1 has fired (stage 1)
+    assert "nvalidated" not in text and "🚫" not in text  # no separate list of invalidated setups
+    assert not hasattr(DailySweepService, "list_invalidated")  # and no query for one
 
 
-def test_sweeps_with_only_invalidated_setups_says_nothing_is_active():
-    sell, _ = case(SELL)
-    svc = DailySweepService("k", None, None, None)
-
-    async def none_active():
-        return []
-
-    async def one():
-        return [(sell, None, None)]
-
-    svc.list_active, svc.list_invalidated = none_active, one
-    text = asyncio.run(svc.get_sweeps_message())
-    assert "No active setups right now." in text and "AUDJPY</b> SELL — swept Day 2 low 108.915" in text
-
-
-def test_sweeps_with_nothing_at_all():
+def test_sweeps_with_nothing_active_says_so():
     svc = DailySweepService("k", None, None, None)
 
     async def empty():
         return []
 
-    svc.list_active, svc.list_invalidated = empty, empty
+    svc.list_active = empty
     assert "No active setups right now." in asyncio.run(svc.get_sweeps_message())
 
 
@@ -489,3 +475,95 @@ def test_invalidation_is_evaluated_before_stage_advancement():
     assert state.next_stage(SWEEP) == 1 and state.invalidates(SWEEP)  # the one price does both
     _, sent, db, _ = _play_mp(state, [SWEEP])
     assert types(sent) == ["INVALIDATED"] and db["status"] == "INVALIDATED" and db["claims"] == [(0, "INVALIDATED")]
+
+
+# ── The threshold sign: SELL = Day 2 low MINUS the buffer, BUY = Day 2 high PLUS it ──────────────────
+# 5-dp pair, pip 0.0001: a SELL with Day 2 low 0.56504 voids below 0.56484; a BUY with Day 2 high 0.57600 above 0.57620
+
+def _example(direction):
+    day3 = datetime.datetime(2026, 11, 19, 22, tzinfo=datetime.timezone.utc)
+    if direction == SELL:
+        return SetupState(id=1, pair="AUDCHF", direction=SELL, day1=(0.5700, 0.5750, 0.5653, 0.5660),
+                          day2=(0.5660, 0.5655, 0.56504, 0.5652), level=0.5653, day2_date=D(2026, 11, 17),
+                          day3_expires_at=day3, kind="CONTINUATION", level2=0.5656)
+    return SetupState(id=1, pair="AUDCHF", direction=BUY, day1=(0.5650, 0.5750, 0.5640, 0.5745),
+                      day2=(0.5745, 0.57600, 0.5705, 0.5755), level=0.5750, day2_date=D(2026, 11, 17),
+                      day3_expires_at=day3, kind="CONTINUATION", level2=0.5745)
+
+
+# (direction, price, voids?)
+THRESHOLD_CASES = [
+    (SELL, 0.56504, False),  # exactly at Day 2's low
+    (SELL, 0.56500, False),  # 0.4 pip below it
+    (SELL, 0.56494, False),  # 1 pip below it (within the buffer)
+    (SELL, 0.56484, False),  # exactly the buffer below it
+    (SELL, 0.56483, True),  # 2.1 pips below it
+    (SELL, 0.56200, True),
+    (SELL, 0.57000, False),  # the BUY-side extreme direction: never voids a SELL
+    (SELL, 0.58500, False),
+    (BUY, 0.57600, False),  # exactly at Day 2's high
+    (BUY, 0.57610, False),  # 1 pip above it
+    (BUY, 0.57620, False),  # exactly the buffer above it
+    (BUY, 0.57621, True),  # 2.1 pips above it
+    (BUY, 0.58000, True),
+    (BUY, 0.57000, False),  # below Day 2's low: never voids a BUY
+    (BUY, 0.55000, False),
+]
+
+
+@pytest.mark.parametrize("direction,price,voids", THRESHOLD_CASES)
+def test_threshold_decision_on_a_live_tick(direction, price, voids):
+    state = _example(direction)
+    assert state.invalidates(price) is voids
+    assert swept_day2_extreme(direction, state.day2[1], state.day2[2], price, "AUDCHF") is voids
+
+
+@pytest.mark.parametrize("direction,price,voids", [c for c in THRESHOLD_CASES if (c[0] == SELL and 0.5600 < c[1] < 0.5660) or
+                                                   (c[0] == BUY and c[1] > 0.5755)])
+def test_threshold_through_check_tick_never_alerts_unless_it_voids(direction, price, voids):
+    """End to end (real check_tick + claim): none of these prices reaches a level, so the only possible
+    outcome is an invalidation, and it happens exactly when the threshold is passed."""
+    state = _example(direction)
+    _, sent, db, _ = _play_mp(state, [price])
+    assert (types(sent) == ["INVALIDATED"]) is voids and len(sent) == (1 if voids else 0)
+    assert db["status"] == ("INVALIDATED" if voids else "ACTIVE")
+
+
+def test_displayed_threshold_equals_the_checked_threshold():
+    sell, buy = _example(SELL), _example(BUY)
+    assert sell.invalidation_price == pytest.approx(sell.day2[2] - 2 * 0.0001)  # low − buffer
+    assert buy.invalidation_price == pytest.approx(buy.day2[1] + 2 * 0.0001)  # high + buffer
+    assert sm.format_price("AUDCHF", sell.invalidation_price) == "0.56484"
+    assert sm.format_price("AUDCHF", buy.invalidation_price) == "0.57620"
+    # The number shown is exactly the boundary of the live check: not voided AT it, voided just past it
+    assert not sell.invalidates(sell.invalidation_price) and sell.invalidates(sell.invalidation_price - 0.00001)
+    assert not buy.invalidates(buy.invalidation_price) and buy.invalidates(buy.invalidation_price + 0.00001)
+    svc = DailySweepService("k", None, None, None)
+
+    async def both():
+        return [sell, buy]
+
+    svc.list_active = both
+    text = asyncio.run(svc.get_sweeps_message())
+    assert "Voided if price trades beyond 0.56484 (Day 2 low − 2 pips) before ①" in text
+    assert "Voided if price trades beyond 0.57620 (Day 2 high + 2 pips) before ①" in text
+
+
+@both
+def test_scan_time_and_late_arming_use_the_same_threshold_just_past_the_buffer(direction):
+    # scan time (bars since Day 2's close): 2.1 pips past Day 2's extreme skips the setup; exactly 2.0 does not
+    result, stored = _scan([_bar(direction, 111.106)], direction)
+    assert result.status == "invalidated" and stored == []
+    result, stored = _scan([_bar(direction, EXACT)], direction)
+    assert result.status == "new" and len(stored) == 1
+    # late arming (price when armed)
+    for price, voids in ((111.106, True), (EXACT, False)):
+        state, f = case(direction)
+        db = _db(state)
+        arm = ny(2026, 10, 27, 17, 10)
+        with pytest.MonkeyPatch.context() as mp:
+            svc, sent, _ = _service(mp, state, db)
+            svc.clock = lambda: arm
+            svc.get_last_price = lambda symbol, p=price, f=f: (f(p), arm)
+            asyncio.run(svc._trigger_if_already_reached(state))
+        assert (types(sent) == ["INVALIDATED"]) is voids and (db["status"] == "INVALIDATED") is voids
