@@ -464,3 +464,91 @@ def test_invalidation_vs_trigger_race_between_two_instances_has_exactly_one_outc
                     assert (row.status, row.stage) == ("ACTIVE", 1) and "LEVEL 1 HIT" in messages[0]
 
     run(body)
+
+
+# ── Armed late: stored at the stage the 1H-bar replay found ─────────────────
+
+def test_late_armed_setup_is_stored_at_its_stage_and_resumes_from_it():
+    async def body():
+        async with pg() as (engine, Session):
+            svc, users, sent = _service()
+            async with Session() as session:
+                session.add(User(chat_id="cont", is_approved=True))
+                await session.commit()
+            await users.set_daily_continuation_alerts_enabled("cont", True)
+
+            hit1 = sm.ReplayEvent(1, utc(2026, 10, 28, 1), 110.700)
+            hit2 = sm.ReplayEvent(2, utc(2026, 10, 28, 3), 110.500)
+            started = await svc._store_setup(*_cont_args("AUDJPY"), stage=1, reached=hit1)
+            done = await svc._store_setup(*_cont_args("GBPJPY"), stage=2, reached=hit2)
+            fresh = await svc._store_setup(*_cont_args("NZDJPY"))
+
+            row = await _row(Session, started.id)
+            assert (row.stage, row.status, row.triggered_at, row.trigger_price) == (1, "ACTIVE", hit1.bar_start, 110.700)
+            row = await _row(Session, done.id)
+            assert (row.stage, row.status, row.trigger_price) == (2, "TRIGGERED", 110.500)
+            assert (started.stage, done.stage, fresh.stage) == (1, 2, 0)
+            row = await _row(Session, fresh.id)
+            assert (row.stage, row.status, row.triggered_at) == (0, "ACTIVE", None)
+
+            # A rescan hits the (pair, day2_date) unique constraint: no second row, so nothing to announce twice
+            assert await svc._store_setup(*_cont_args("AUDJPY"), stage=1, reached=hit1) is None
+
+            # Restart: the stage-1 and stage-0 rows are resumed as they were; the completed one is not loaded
+            await svc.bootstrap()
+            assert {s.pair: s.stage for pairs in svc._active.values() for s in pairs} == {"AUDJPY": 1, "NZDJPY": 0}
+            await svc.check_tick("AUDJPY", 110.760, None)  # Level 1 again: already fired, must NOT re-alert
+            assert sent == []
+            assert await svc._claim_stage(started, 0, 1, 110.7, MID_DAY3) is False  # SQL agrees
+            await svc.check_tick("AUDJPY", 110.510, None)  # Level 2: the only alert left
+            assert len(sent) == 1 and "LEVEL 2 HIT" in sent[0][1]
+            assert (await _row(Session, started.id)).status == "TRIGGERED"
+
+    run(body)
+
+
+class _MD:
+    def __init__(self, bars):
+        self.bars = bars
+
+    async def get_candles(self, pair, interval, api_key, outputsize=2):
+        return self.bars, False
+
+    async def get_current_price(self, symbol, api_key):
+        return None, False
+
+
+def test_rerunning_a_scan_does_not_announce_an_earlier_hit_twice():
+    async def body():
+        async with pg() as (engine, Session):
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(sm, "SCAN_REQUEST_SPACING_SECONDS", 0)
+                svc, users, sent = _service()
+                async with Session() as session:
+                    session.add(User(chat_id="cont", is_approved=True))
+                    await session.commit()
+                await users.set_daily_continuation_alerts_enabled("cont", True)
+
+                from test_daily_sweep import day_hours, ny
+                close = ny(2026, 10, 27, 17)
+                bars = day_hours(D(2026, 10, 26), *MON_C) + day_hours(D(2026, 10, 27), *TUE_C)
+                # 17:00 NY bar (after Day 2 closed): dips to 110.700, i.e. through Level 1 (110.762), no sweep of 111.085
+                bars.append({"datetime": close, "open": 110.9, "high": 110.95, "low": 110.700, "close": 110.8})
+                svc.market_data = _MD(bars)
+                svc.clock = lambda: ny(2026, 10, 27, 17, 10)
+                svc.pairs = ["AUDJPY"]
+
+                first = await svc.run_scan()
+                assert [r.status for r in first.results] == ["new"]
+                async with Session() as session:  # closed again: an open transaction would block the schema cleanup
+                    row = (await session.execute(select(DailySweepSetup))).scalar_one()
+                assert (row.kind, row.stage, row.status, row.trigger_price) == ("CONTINUATION", 1, "ACTIVE", 110.700)
+                assert len(sent) == 2 and "Daily Setups" in sent[0][1]  # the digest, then the "reached earlier" alert
+                assert "LEVEL 1 HIT" in sent[1][1] and "reached earlier" in sent[1][1]
+
+                sent.clear()
+                second = await svc.run_scan()  # e.g. the catch-up scan or a second /sweepscan
+                assert [r.status for r in second.results] == ["duplicate"]
+                assert sent == []
+
+    run(body)
