@@ -423,18 +423,19 @@ def test_invalidation_claim_sql_lifecycle():
             assert await svc._claim_invalidation(sweep, 1e9, MID_DAY3) is False
             assert (await _row(Session, sweep.id)).status == "ACTIVE"
 
-            # Reading it back: bootstrap skips INVALIDATED rows; /sweeps lists it apart; expiry leaves it alone
+            # Reading it back: bootstrap skips INVALIDATED rows; /sweeps simply doesn't list it; expiry leaves it alone
             fresh, _, _ = _service()
             await fresh.bootstrap()
             assert fresh.active_symbols() == {"GBPJPY", "NZDJPY", "EURUSD"}
-            invalidated = await fresh.list_invalidated()
-            assert [(s.pair, price, at) for s, price, at in invalidated] == [("AUDJPY", SWEPT, MID_DAY3)]
-            assert "AUDJPY" in (await fresh.get_sweeps_message()).split("Invalidated")[1]
+            listing = await fresh.get_sweeps_message()
+            assert "AUDJPY" not in listing and "nvalidated" not in listing  # gone, with no separate section
+            assert all(pair in listing for pair in ("GBPJPY", "NZDJPY", "EURUSD"))
+            audit = await _row(Session, voided.id)  # ...but the row is kept for audit
+            assert (audit.status, audit.invalidated_price, audit.invalidated_at) == ("INVALIDATED", SWEPT, MID_DAY3)
             fresh.clock = lambda: expiry + datetime.timedelta(minutes=1)
             await fresh.expire_setups()
             assert (await _row(Session, voided.id)).status == "INVALIDATED"  # not rewritten to EXPIRED
             assert (await _row(Session, late.id)).status == "EXPIRED"
-            assert await fresh.list_invalidated() == []  # gone from /sweeps once Day 3 has ended
 
     run(body)
 

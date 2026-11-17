@@ -121,7 +121,8 @@ class DailySweepSetup(Base):
     status: Mapped[str] = mapped_column(String(16), index=True, default="ACTIVE")
     triggered_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     trigger_price: Mapped[float | None] = mapped_column(Numeric(18, 6, asdecimal=False), nullable=True)
-    # Set when status becomes INVALIDATED: when, and the price that swept Day 2's extreme
+    # Set when status becomes INVALIDATED: when the sweep was DETECTED (not necessarily when it happened, e.g.
+    # after a restart), and the price seen then
     invalidated_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     invalidated_price: Mapped[float | None] = mapped_column(Numeric(18, 6, asdecimal=False), nullable=True)
 
