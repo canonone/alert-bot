@@ -149,6 +149,11 @@ def test_single_alert_shown_in_digest_sweepcheck_and_sweeps():
         return [merged, apart]
 
     svc.list_active = active
+
+    async def no_invalidated():
+        return []
+
+    svc.list_invalidated = no_invalidated
     listing = asyncio.run(svc.get_sweeps_message())
     assert listing.count("single alert") == 1 and "levels 2.4 pips apart" in listing
 

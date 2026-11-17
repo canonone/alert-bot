@@ -116,10 +116,14 @@ class DailySweepSetup(Base):
     # Close of Day 3 (UTC) — the setup is cancelled if the level isn't reached by then
     day3_expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
 
-    # ACTIVE | TRIGGERED (all stages sent) | EXPIRED
-    status: Mapped[str] = mapped_column(String(10), index=True, default="ACTIVE")
+    # ACTIVE | TRIGGERED (all stages sent) | EXPIRED | INVALIDATED (continuation only: Day 2's extreme was
+    # swept before Level 1 was reached)
+    status: Mapped[str] = mapped_column(String(16), index=True, default="ACTIVE")
     triggered_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     trigger_price: Mapped[float | None] = mapped_column(Numeric(18, 6, asdecimal=False), nullable=True)
+    # Set when status becomes INVALIDATED: when, and the price that swept Day 2's extreme
+    invalidated_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidated_price: Mapped[float | None] = mapped_column(Numeric(18, 6, asdecimal=False), nullable=True)
 
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

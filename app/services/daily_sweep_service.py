@@ -26,6 +26,7 @@ BUY = "BUY"
 ACTIVE = "ACTIVE"
 TRIGGERED = "TRIGGERED"
 EXPIRED = "EXPIRED"
+INVALIDATED = "INVALIDATED"
 
 SWEEP_KIND = "SWEEP"
 CONTINUATION_KIND = "CONTINUATION"
@@ -131,6 +132,11 @@ PAIR_MERGE_LEVELS_PIPS: dict[str, float] = {}
 #   from it. Twelve Data's extremes can sit a fraction of a pip inside FOREX.com's, so a near-touch is a touch.
 OPPOSITE_SIDE_BUFFER_PIPS = 2.0
 PAIR_OPPOSITE_SIDE_BUFFER_PIPS: dict[str, float] = {}
+# - CONTINUATION only: on Day 3 the retrace to the points of interest is void if price first sweeps Day 2's
+#   extreme (BUY: Day 2 high, SELL: Day 2 low). Price must exceed that extreme by MORE than this many pips,
+#   because the three feeds disagree by a few pips.
+SWEEP_INVALIDATION_BUFFER_PIPS = 2.0
+PAIR_SWEEP_INVALIDATION_BUFFER_PIPS: dict[str, float] = {}
 
 _PIP_EPS = 1e-6  # float slack when comparing pip distances to a threshold
 
@@ -145,6 +151,10 @@ def min_body_pips_for(pair: str) -> float:
 
 def opposite_side_buffer_pips_for(pair: str) -> float:
     return PAIR_OPPOSITE_SIDE_BUFFER_PIPS.get(pair, OPPOSITE_SIDE_BUFFER_PIPS)
+
+
+def sweep_invalidation_buffer_pips_for(pair: str) -> float:
+    return PAIR_SWEEP_INVALIDATION_BUFFER_PIPS.get(pair, SWEEP_INVALIDATION_BUFFER_PIPS)
 
 
 def merge_levels_pips_for(pair: str) -> float:
@@ -555,6 +565,32 @@ def level_reached(direction: str, level: float, price: float) -> bool:
     return price >= level if direction == SELL else price <= level
 
 
+def day2_extreme_for(direction: str, day2_high: float, day2_low: float) -> float:
+    """The Day 2 extreme whose sweep voids a continuation: the HIGH for a BUY, the LOW for a SELL.
+    (Not the stop idea, which is the opposite extreme.)"""
+    return day2_high if direction == BUY else day2_low
+
+
+def swept_day2_extreme(direction: str, day2_high: float, day2_low: float, seen: float, pair: str = "") -> bool:
+    """True if `seen` (a price, or a bar's high for a BUY / low for a SELL) is beyond Day 2's extreme by MORE
+    than SWEEP_INVALIDATION_BUFFER_PIPS. Exactly the buffer does not count."""
+    pip = pip_size(pair)
+    if direction == BUY:
+        excess = (seen - day2_high) / pip
+    else:
+        excess = (day2_low - seen) / pip
+    return excess > sweep_invalidation_buffer_pips_for(pair) + _PIP_EPS
+
+
+def extremes_since(candles_1h: list[dict], since_utc: datetime.datetime) -> tuple[float, float] | None:
+    """(highest high, lowest low) of the 1H bars starting at/after `since_utc`, including the still-forming
+    bar and skipping the weekend window. None if there are no such bars."""
+    bars = [b for b in candles_1h if b["datetime"] >= since_utc and not is_market_closed(b["datetime"])]
+    if not bars:
+        return None
+    return max(b["high"] for b in bars), min(b["low"] for b in bars)
+
+
 def should_catch_up(last_scanned_day: datetime.date | None, now_utc: datetime.datetime) -> bool:
     """Startup decision: has the most recent closed trading day gone unscanned while its Day 3 is
     still running? Skipped while the scheduled 17:10 scan for that day is still to come."""
@@ -629,6 +665,23 @@ class SetupState:
     @property
     def final_stage(self) -> int:
         return 2 if self.kind == CONTINUATION_KIND else 1
+
+    @property
+    def invalidation_extreme(self) -> float:
+        """Day 2's high (BUY) / low (SELL): sweeping it before Level 1 voids a continuation."""
+        return day2_extreme_for(self.direction, self.day2[1], self.day2[2])
+
+    @property
+    def invalidation_price(self) -> float:
+        """The price that must be exceeded (extreme plus the buffer) for the sweep to count."""
+        distance = sweep_invalidation_buffer_pips_for(self.pair) * pip_size(self.pair)
+        return self.invalidation_extreme + distance if self.direction == BUY else self.invalidation_extreme - distance
+
+    def invalidates(self, price: float) -> bool:
+        """CONTINUATION only, and only until Level 1 has fired: has `price` swept Day 2's extreme?"""
+        if self.kind != CONTINUATION_KIND or self.stage != 0:
+            return False
+        return swept_day2_extreme(self.direction, self.day2[1], self.day2[2], price, self.pair)
 
     @property
     def levels_apart_pips(self) -> float | None:
@@ -757,6 +810,21 @@ def format_level_hit(
     )
 
 
+def format_invalidation(setup: SetupState, price: float, now_utc: datetime.datetime) -> str:
+    pair = setup.pair
+    side = "high" if setup.direction == BUY else "low"
+    return (
+        f"🚫 <b>SETUP INVALIDATED — {pair} ({setup.direction})</b>\n\n"
+        f"Setup invalidated: price swept Day 2's {side} before reaching the points of interest.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📍 <b>Day 2 {side.capitalize()} (swept):</b> {format_price(pair, setup.invalidation_extreme)}\n"
+        f"💰 <b>Price:</b> {format_price(pair, price)}\n"
+        f"🕐 <b>Time:</b> {_wat_str(now_utc)}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "This setup will not alert any more."
+    )
+
+
 def _single_alert_note(pair: str, signal: "ContinuationSignal") -> str:
     apart = abs(signal.level - signal.level2) / pip_size(pair)
     if apart <= merge_levels_pips_for(pair) + _PIP_EPS:
@@ -857,7 +925,7 @@ def format_candle_line(pair: str, label: str, candle: DailyCandle) -> str:
 @dataclass
 class PairScan:
     pair: str
-    status: str  # new | none | duplicate | lag | quota | nodata | gap | stale
+    status: str  # new | none | duplicate | lag | quota | nodata | gap | stale | invalidated
     setup: SetupState | None = None
 
 
@@ -887,6 +955,7 @@ class ScanReport:
             "nodata": "no data",
             "gap": "non-consecutive/unusable days",
             "stale": "already past Day 3",
+            "invalidated": "swept Day 2's extreme before arming",
         }
         parts = [f"{counts[k]} {labels[k]}" for k in labels if k in counts]
         return f"Scanned {len(self.results)} pair(s): " + ", ".join(parts)
@@ -1016,7 +1085,12 @@ class DailySweepService:
     async def _trigger_if_already_reached(self, setup: SetupState) -> None:
         """Price may already be at/through the level(s) between Day 2's close and the scan."""
         price = await self._price_for_arming(setup.pair)
-        if price is None or setup.next_stage(price) is None:
+        if price is None:
+            return
+        if setup.invalidates(price):  # explicit order: invalidation is evaluated before stage advancement
+            await self._invalidate(setup, price, self.clock())
+            return
+        if setup.next_stage(price) is None:
             return
         logger.info(f"[DailySweep] {setup.pair} level {setup.level} already reached (last price {price}) when armed")
         await self._trigger(setup, price, self.clock(), pre_armed=True)
@@ -1134,6 +1208,9 @@ class DailySweepService:
         if is_expired(expires_at, now):
             return PairScan(pair, "stale")
 
+        if signal.kind == CONTINUATION_KIND and await self._swept_before_arming(pair, signal, day2, candles_1h):
+            return PairScan(pair, "invalidated")
+
         setup = await self._store_setup(pair, signal, day1, day2, expires_at)
         if setup is None:
             logger.info(f"[DailySweep] {pair} setup for Day 2 {day2.date} already stored")
@@ -1151,6 +1228,30 @@ class DailySweepService:
             except Exception as error:
                 logger.error(f"[DailySweep] Could not subscribe {pair} to the live feed: {error}")
         return PairScan(pair, "new", setup)
+
+    async def _swept_before_arming(
+        self, pair: str, signal: "ContinuationSignal", day2: DailyCandle, candles_1h: list[dict]
+    ) -> bool:
+        """Has price already swept Day 2's extreme since Day 2 closed? Uses the 1H bars from this scan's own fetch
+        (including the in-progress 17:00 bar); only if there are none, the fresh Finnhub tick / Twelve Data price."""
+        extremes = extremes_since(candles_1h, day2.end_utc)
+        if extremes is not None:
+            high, low = extremes
+            seen, source = (high if signal.direction == BUY else low), "1H bars since Day 2 close"
+        else:
+            price = await self._price_for_arming(pair)
+            if price is None:
+                return False  # nothing to judge by: arm it as normal
+            seen, source = price, "current price"
+        if not swept_day2_extreme(signal.direction, day2.high, day2.low, seen, pair):
+            return False
+        extreme = day2_extreme_for(signal.direction, day2.high, day2.low)
+        logger.info(
+            f"[DailySweep] {pair} {signal.kind} {signal.direction} setup NOT created: Day 2 "
+            f"{'high' if signal.direction == BUY else 'low'} {extreme} already swept since Day 2 closed "
+            f"({source}: {seen}, buffer {sweep_invalidation_buffer_pips_for(pair):g} pips)"
+        )
+        return True
 
     async def _store_setup(
         self,
@@ -1208,8 +1309,51 @@ class DailySweepService:
         for setup in list(setups):
             if is_expired(setup.day3_expires_at, now):
                 continue  # expiry job hasn't run yet — never fire after Day 3 has closed
+            # Invalidation is evaluated BEFORE stage advancement
+            if setup.invalidates(price):
+                await self._invalidate(setup, price, now)
+                continue
             if setup.next_stage(price) is not None:
                 await self._trigger(setup, price, now)
+
+    async def _invalidate(self, setup: SetupState, price: float, now: datetime.datetime) -> None:
+        """Price swept Day 2's extreme before Level 1: void the setup (claim first, then notify, once)."""
+        try:
+            claimed = await self._claim_invalidation(setup, price, now)
+        except Exception as error:
+            logger.error(f"[DailySweep] Could not invalidate setup #{setup.id}, will retry on next tick: {error}")
+            return
+        if not claimed:
+            # Lost a race with a trigger (it advanced the stage and keeps the setup), expiry, or another instance
+            if setup.stage == 0:
+                self._cache_remove(setup.id)
+            return
+        self._cache_remove(setup.id)
+        logger.info(
+            f"[DailySweep] {setup.pair} {setup.kind} {setup.direction} setup #{setup.id} INVALIDATED: price {price} "
+            f"swept Day 2 {'high' if setup.direction == BUY else 'low'} {setup.invalidation_extreme} "
+            f"(buffer {sweep_invalidation_buffer_pips_for(setup.pair):g} pips) before Level 1"
+        )
+        await self._broadcast(format_invalidation(setup, price, now), setup.kind)
+
+    async def _claim_invalidation(self, setup: SetupState, price: float, now: datetime.datetime) -> bool:
+        """Atomic ACTIVE -> INVALIDATED, only while still at stage 0 and before Day 3 closes: it can't race a
+        trigger (whichever UPDATE lands first wins) and can't send twice."""
+        async with SessionLocal() as session:
+            result = await session.execute(
+                update(DailySweepSetup)
+                .where(
+                    DailySweepSetup.id == setup.id,
+                    DailySweepSetup.kind == CONTINUATION_KIND,  # a sweep can never be invalidated
+                    DailySweepSetup.status == ACTIVE,
+                    DailySweepSetup.stage == 0,
+                    DailySweepSetup.day3_expires_at > now,
+                )
+                .values(status=INVALIDATED, invalidated_at=now, invalidated_price=price)
+            )
+            claimed = result.rowcount == 1
+            await session.commit()
+        return claimed
 
     async def _trigger(
         self, setup: SetupState, price: float, now: datetime.datetime, pre_armed: bool = False
@@ -1304,11 +1448,24 @@ class DailySweepService:
             )
             return [SetupState.from_model(row) for row in result.scalars().all()]
 
+    async def list_invalidated(self) -> list[tuple[SetupState, float | None, datetime.datetime | None]]:
+        """Continuations voided during the Day 3 that is still running: (setup, sweeping price, when)."""
+        now = self.clock()
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(DailySweepSetup)
+                .where(DailySweepSetup.status == INVALIDATED, DailySweepSetup.day3_expires_at > now)
+                .order_by(DailySweepSetup.invalidated_at, DailySweepSetup.pair)
+            )
+            return [(SetupState.from_model(r), r.invalidated_price, r.invalidated_at) for r in result.scalars().all()]
+
     async def get_sweeps_message(self) -> str:
         setups = await self.list_active()
-        if not setups:
+        invalidated = await self.list_invalidated()
+        if not setups and not invalidated:
             return "🗓 <b>Daily Setups</b>\n\nNo active setups right now."
-        lines = ["🗓 <b>Daily Setups — Active</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        lines = ["🗓 <b>Daily Setups — Active</b>" if setups else "🗓 <b>Daily Setups</b>\n\nNo active setups right now.",
+                 "━━━━━━━━━━━━━━━━━━━━"]
         for s in setups:
             emoji = "🔻" if s.direction == SELL else "🔺"
             if s.kind == CONTINUATION_KIND:
@@ -1320,6 +1477,12 @@ class DailySweepService:
                     f"   ① Day 1 {side}: {format_price(s.pair, s.level)} — {hit1}\n"
                     f"   ② Day 2 open: {format_price(s.pair, s.level2)} — {hit2}\n"
                     + (f"   single alert (levels {s.levels_apart_pips:.1f} pips apart)\n" if s.merged else "")
+                    + (
+                        f"   ⚠️ Voided if price trades beyond {format_price(s.pair, s.invalidation_price)} "
+                        f"(Day 2 {'high' if s.direction == BUY else 'low'} + "
+                        f"{sweep_invalidation_buffer_pips_for(s.pair):g} pips) before ①\n"
+                        if s.stage == 0 else ""
+                    )
                     + f"   Expires: {_wat_str(s.day3_expires_at)}"
                 )
             else:
@@ -1327,6 +1490,19 @@ class DailySweepService:
                     f"🔁 SWEEP {emoji} <b>{s.pair}</b> {s.direction} @ {format_price(s.pair, s.level)}\n"
                     f"   Expires: {_wat_str(s.day3_expires_at)}"
                 )
+        if invalidated:
+            if setups:
+                lines.append("")
+            lines.append("🚫 <b>Invalidated</b> (no longer alerting)")
+            for s, swept_price, swept_at in invalidated:
+                emoji = "🔻" if s.direction == SELL else "🔺"
+                side = "high" if s.direction == BUY else "low"
+                detail = f"swept Day 2 {side} {format_price(s.pair, s.invalidation_extreme)}"
+                if swept_price is not None:
+                    detail += f" @ {format_price(s.pair, swept_price)}"
+                if swept_at is not None:
+                    detail += f" · {_wat_str(swept_at)}"
+                lines.append(f"📈 CONTINUATION {emoji} <b>{s.pair}</b> {s.direction} — {detail}")
         lines.append("━━━━━━━━━━━━━━━━━━━━")
         return "\n".join(lines)
 
