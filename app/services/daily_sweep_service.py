@@ -582,13 +582,81 @@ def swept_day2_extreme(direction: str, day2_high: float, day2_low: float, seen: 
     return excess > sweep_invalidation_buffer_pips_for(pair) + _PIP_EPS
 
 
-def extremes_since(candles_1h: list[dict], since_utc: datetime.datetime) -> tuple[float, float] | None:
-    """(highest high, lowest low) of the 1H bars starting at/after `since_utc`, including the still-forming
-    bar and skipping the weekend window. None if there are no such bars."""
+def bars_since(candles_1h: list[dict], since_utc: datetime.datetime) -> list[dict]:
+    """The 1H bars starting at/after `since_utc`, oldest first, including the still-forming bar and skipping the
+    weekend window."""
     bars = [b for b in candles_1h if b["datetime"] >= since_utc and not is_market_closed(b["datetime"])]
+    return sorted(bars, key=lambda b: b["datetime"])
+
+
+def extremes_since(candles_1h: list[dict], since_utc: datetime.datetime) -> tuple[float, float] | None:
+    """(highest high, lowest low) of the 1H bars starting at/after `since_utc`. None if there are no such bars."""
+    bars = bars_since(candles_1h, since_utc)
     if not bars:
         return None
     return max(b["high"] for b in bars), min(b["low"] for b in bars)
+
+
+def levels_apart_in_pips(pair: str, level: float, level2: float) -> float:
+    return abs(level - level2) / pip_size(pair)
+
+
+def levels_merged(pair: str, level: float, level2: float) -> bool:
+    """Levels within MERGE_LEVELS_PIPS are one zone: a single alert when Level 1 is reached."""
+    return levels_apart_in_pips(pair, level, level2) <= merge_levels_pips_for(pair) + _PIP_EPS
+
+
+@dataclass(frozen=True)
+class ReplayEvent:
+    stage: int  # 1 = Level 1 reached, 2 = Level 2 reached (or the merged zone)
+    bar_start: datetime.datetime  # the 1H bar in which price reached it
+    price: float  # that bar's extreme toward the level (BUY: its low, SELL: its high)
+
+
+@dataclass(frozen=True)
+class ArmingReplay:
+    voided: bool  # Day 2's extreme was swept before Level 1 (or in the same 1H bar as it: order unknowable)
+    stage: int  # how far the setup had already got by the end of the replay
+    events: tuple[ReplayEvent, ...] = ()
+    ambiguous: bool = False
+    swept_at: datetime.datetime | None = None
+    swept_price: float | None = None
+
+
+def replay_since_day2_close(
+    direction: str,
+    level: float,
+    level2: float,
+    day2_high: float,
+    day2_low: float,
+    pair: str,
+    bars: list[dict],
+) -> ArmingReplay:
+    """Walks the 1H bars since Day 2's close IN ORDER with the live rule, so a setup armed late ends up exactly
+    where a live bot would have left it: Day 2's extreme swept (by more than the buffer) while still at stage 0
+    voids it; reaching Level 1 first moves it to stage 1 (a later sweep no longer matters), then Level 2 to
+    stage 2; a merged zone completes at Level 1. A bar that both sweeps and reaches Level 1 can't be ordered, so
+    it voids (never claim an alert we're unsure of)."""
+    merged = levels_merged(pair, level, level2)
+    stage, events = 0, []
+    for bar in bars:
+        toward_level = bar["low"] if direction == BUY else bar["high"]  # the bar's extreme toward Level 1/2
+        if stage == 0:
+            beyond = bar["high"] if direction == BUY else bar["low"]  # the bar's extreme toward Day 2's extreme
+            swept = swept_day2_extreme(direction, day2_high, day2_low, beyond, pair)
+            reached = level_reached(direction, level, toward_level)
+            if swept:
+                return ArmingReplay(True, 0, ambiguous=reached, swept_at=bar["datetime"], swept_price=beyond)
+            if reached:
+                if merged:
+                    return ArmingReplay(False, 2, (ReplayEvent(2, bar["datetime"], toward_level),))
+                stage = 1
+                events.append(ReplayEvent(1, bar["datetime"], toward_level))
+                if level_reached(direction, level2, toward_level):  # the same bar went on to Level 2
+                    return ArmingReplay(False, 2, tuple(events + [ReplayEvent(2, bar["datetime"], toward_level)]))
+        elif level_reached(direction, level2, toward_level):
+            return ArmingReplay(False, 2, tuple(events + [ReplayEvent(2, bar["datetime"], toward_level)]))
+    return ArmingReplay(False, stage, tuple(events))
 
 
 def should_catch_up(last_scanned_day: datetime.date | None, now_utc: datetime.datetime) -> bool:
@@ -688,13 +756,14 @@ class SetupState:
         """Distance between a continuation's two levels, in pips (None for sweeps)."""
         if self.kind != CONTINUATION_KIND or self.level2 is None:
             return None
-        return abs(self.level - self.level2) / pip_size(self.pair)
+        return levels_apart_in_pips(self.pair, self.level, self.level2)
 
     @property
     def merged(self) -> bool:
         """Levels within MERGE_LEVELS_PIPS are one zone: a single alert when Level 1 is reached."""
-        apart = self.levels_apart_pips
-        return apart is not None and apart <= merge_levels_pips_for(self.pair) + _PIP_EPS
+        return self.level2 is not None and self.kind == CONTINUATION_KIND and levels_merged(
+            self.pair, self.level, self.level2
+        )
 
     def next_stage(self, price: float) -> int | None:
         """The stage this price would move the setup to, or None if it fires nothing. A price past
@@ -841,6 +910,7 @@ def format_continuation_hit(
     now_utc: datetime.datetime,
     hit: str,  # "1" | "2" | "both"
     pre_armed: bool = False,
+    earlier_note: str | None = None,
 ) -> str:
     """`both` for a merged setup (levels within MERGE_LEVELS_PIPS) is ONE zone alert at Level 1."""
     pair = setup.pair
@@ -849,7 +919,8 @@ def format_continuation_hit(
     stop_side = "Low" if is_buy else "High"
     l1 = format_price(pair, setup.level)
     l2 = format_price(pair, setup.level2)
-    current = f"💰 <b>Current Price:</b> {format_price(pair, price)}"
+    price_label = "Price reached" if earlier_note else "Current Price"
+    current = f"💰 <b>{price_label}:</b> {format_price(pair, price)}"
     level1_line = f"① <b>Day 1 {broken} (broken):</b> {l1}"
     stop_line = f"🛡 <b>Day 2 {stop_side}:</b> {format_price(pair, setup.sweep_extreme)} — invalidation / SL idea"
 
@@ -890,6 +961,7 @@ def format_continuation_hit(
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"{explanation}"
         + ("\n⚡ Level was reached before the setup was armed (between Day 2 close and the scan)." if pre_armed else "")
+        + (f"\n⚡ {earlier_note}" if earlier_note else "")
     )
 
 
@@ -930,6 +1002,7 @@ class PairScan:
     pair: str
     status: str  # new | none | duplicate | lag | quota | nodata | gap | stale | invalidated
     setup: SetupState | None = None
+    earlier: tuple[ReplayEvent, ...] = ()  # levels the replay found already reached before arming
 
 
 @dataclass
@@ -1077,9 +1150,13 @@ class DailySweepService:
             new_setups = report.new_setups
             if new_setups:
                 await self._broadcast_digest(new_setups)
-                # After the digest, so the "level hit" message reads as a follow-up to it
-                for setup in new_setups:
-                    await self._trigger_if_already_reached(setup)
+                # After the digest, so the "level hit" messages read as follow-ups to it
+                for result in report.results:
+                    if result.status != "new" or result.setup is None:
+                        continue
+                    await self._announce_earlier(result)
+                    if result.setup.stage < result.setup.final_stage:  # not already complete
+                        await self._trigger_if_already_reached(result.setup)
 
             if not report.retry_pairs:
                 await self._record_scan(expected_day)
@@ -1211,50 +1288,100 @@ class DailySweepService:
         if is_expired(expires_at, now):
             return PairScan(pair, "stale")
 
-        if signal.kind == CONTINUATION_KIND and await self._swept_before_arming(pair, signal, day2, candles_1h):
-            return PairScan(pair, "invalidated")
+        replay: ArmingReplay | None = None
+        if signal.kind == CONTINUATION_KIND:
+            replay = await self._replay_before_arming(pair, signal, day2, candles_1h)
+            if replay.voided:
+                return PairScan(pair, "invalidated")
 
-        setup = await self._store_setup(pair, signal, day1, day2, expires_at)
+        # Armed late? Store it at the stage the replay found, so a live bot's state is what we resume from.
+        # (Only passed when non-zero: the insert is the once-only claim, a rescan hits the unique constraint.)
+        reached = {"stage": replay.stage, "reached": replay.events[-1]} if replay is not None and replay.stage else {}
+        setup = await self._store_setup(pair, signal, day1, day2, expires_at, **reached)
         if setup is None:
             logger.info(f"[DailySweep] {pair} setup for Day 2 {day2.date} already stored")
             return PairScan(pair, "duplicate")
 
-        self._cache_add(setup)
+        earlier = replay.events if replay is not None else ()
+        complete = setup.stage >= setup.final_stage
+        if not complete:
+            self._cache_add(setup)
         logger.info(
             f"[DailySweep] {pair} NEW {signal.kind} {signal.direction} setup #{setup.id} level "
             f"{signal.level}" + (f" / {signal.level2}" if signal.level2 is not None else "")
             + f" (Day 2 {day2.date}) valid until {_wat_str(expires_at)}"
+            + (f" — already at stage {setup.stage} when armed" if setup.stage else "")
         )
-        if self.subscribe_symbol is not None:
+        if not complete and self.subscribe_symbol is not None:
             try:
                 await self.subscribe_symbol(pair)
             except Exception as error:
                 logger.error(f"[DailySweep] Could not subscribe {pair} to the live feed: {error}")
-        return PairScan(pair, "new", setup)
+        return PairScan(pair, "new", setup, earlier)
 
-    async def _swept_before_arming(
+    async def _replay_before_arming(
         self, pair: str, signal: "ContinuationSignal", day2: DailyCandle, candles_1h: list[dict]
-    ) -> bool:
-        """Has price already swept Day 2's extreme since Day 2 closed? Uses the 1H bars from this scan's own fetch
-        (including the in-progress 17:00 bar); only if there are none, the fresh Finnhub tick / Twelve Data price."""
-        extremes = extremes_since(candles_1h, day2.end_utc)
-        if extremes is not None:
-            high, low = extremes
-            seen, source = (high if signal.direction == BUY else low), "1H bars since Day 2 close"
+    ) -> ArmingReplay:
+        """Where would a live bot have left this setup? Replays this scan's own 1H bars since Day 2's close in order
+        (including the in-progress 17:00 bar). Only if there are none, the fresh Finnhub tick / Twelve Data price is
+        checked for a sweep (late arming then checks whether a level is reached)."""
+        bars = bars_since(candles_1h, day2.end_utc)
+        if bars:
+            replay = replay_since_day2_close(
+                signal.direction, signal.level, signal.level2, day2.high, day2.low, pair, bars
+            )
+            source = "1H bars since Day 2 close"
         else:
             price = await self._price_for_arming(pair)
             if price is None:
-                return False  # nothing to judge by: arm it as normal
-            seen, source = price, "current price"
-        if not swept_day2_extreme(signal.direction, day2.high, day2.low, seen, pair):
-            return False
-        extreme = day2_extreme_for(signal.direction, day2.high, day2.low)
-        logger.info(
-            f"[DailySweep] {pair} {signal.kind} {signal.direction} setup NOT created: Day 2 "
-            f"{'high' if signal.direction == BUY else 'low'} {extreme} already swept since Day 2 closed "
-            f"({source}: {seen}, buffer {sweep_invalidation_buffer_pips_for(pair):g} pips)"
-        )
-        return True
+                return ArmingReplay(False, 0)  # nothing to judge by: arm it as normal
+            seen = price
+            swept = swept_day2_extreme(signal.direction, day2.high, day2.low, seen, pair)
+            replay = ArmingReplay(swept, 0, swept_at=self.clock() if swept else None, swept_price=seen if swept else None)
+            source = "current price"
+        if replay.voided:
+            extreme = day2_extreme_for(signal.direction, day2.high, day2.low)
+            logger.info(
+                f"[DailySweep] {pair} {signal.kind} {signal.direction} setup NOT created: Day 2 "
+                f"{'high' if signal.direction == BUY else 'low'} {extreme} already swept since Day 2 closed "
+                f"({source}: {replay.swept_price}, buffer {sweep_invalidation_buffer_pips_for(pair):g} pips)"
+                + (" — the same 1H bar also reached Level 1, so the order is unknown" if replay.ambiguous else "")
+            )
+        elif replay.events:
+            logger.info(
+                f"[DailySweep] {pair} {signal.kind} {signal.direction}: already at stage {replay.stage} when armed — "
+                + ", ".join(f"Level {e.stage} reached in the {_wat_str(e.bar_start)} hour @ {e.price}" for e in replay.events)
+            )
+        return replay
+
+    async def _announce_earlier(self, result: PairScan) -> None:
+        """One message for levels the replay found already reached before the setup was armed."""
+        setup, events = result.setup, result.earlier
+        if setup is None or not events:
+            return
+        last = events[-1]
+        side = "low" if setup.direction == BUY else "high"
+
+        def when(event: ReplayEvent) -> str:
+            start = _to_wat(event.bar_start)
+            return f"{start:%Y-%m-%d %H:%M}–{start + datetime.timedelta(hours=1):%H:%M} WAT"
+
+        if last.stage == 1:
+            hit = "1"
+            note = f"Level 1 was reached earlier — in the {when(last)} hour ({side} {format_price(setup.pair, last.price)}) — before the setup was armed."
+        elif len(events) == 1:  # a merged zone: one level to describe
+            hit = "both"
+            note = f"The level was reached earlier — in the {when(last)} hour ({side} {format_price(setup.pair, last.price)}) — before the setup was armed."
+        else:
+            hit = "both"
+            first = events[0]
+            note = (
+                f"Level 1 was reached earlier in the {when(first)} hour ({side} {format_price(setup.pair, first.price)}) "
+                f"and Level 2 in the {when(last)} hour ({side} {format_price(setup.pair, last.price)}), before the setup was armed."
+            )
+        message = format_continuation_hit(setup, last.price, self.clock(), hit, earlier_note=note)
+        logger.info(f"[DailySweep] {setup.pair} {setup.direction} setup #{setup.id}: announcing levels reached before arming")
+        await self._broadcast(message, setup.kind)
 
     async def _store_setup(
         self,
@@ -1263,7 +1390,12 @@ class DailySweepService:
         day1: DailyCandle,
         day2: DailyCandle,
         expires_at: datetime.datetime,
+        stage: int = 0,
+        reached: ReplayEvent | None = None,
     ) -> SetupState | None:
+        """`stage` / `reached` are for a setup armed late whose levels were already hit (see replay_since_day2_close):
+        it is stored at that stage, and as TRIGGERED if that completes it."""
+        final_stage = 2 if signal.kind == CONTINUATION_KIND else 1
         values = dict(
             pair=pair,
             kind=signal.kind,
@@ -1272,10 +1404,12 @@ class DailySweepService:
             day2_open=day2.open, day2_high=day2.high, day2_low=day2.low, day2_close=day2.close,
             level=signal.level,
             level2=signal.level2,
-            stage=0,
+            stage=stage,
             day2_date=day2.date,
             day3_expires_at=expires_at,
-            status=ACTIVE,
+            status=TRIGGERED if stage >= final_stage else ACTIVE,
+            triggered_at=reached.bar_start if reached else None,
+            trigger_price=reached.price if reached else None,
         )
         async with SessionLocal() as session:
             # (pair, day2_date) is unique — a rescan or retry hits the conflict and inserts nothing
@@ -1300,6 +1434,7 @@ class DailySweepService:
             day3_expires_at=expires_at,
             kind=signal.kind,
             level2=signal.level2,
+            stage=stage,
         )
 
     # ── Real-time tick monitoring ────────────────────────────────────────────
