@@ -81,7 +81,7 @@ Tables are created automatically on first run.
 | `/pairs` | List supported pairs |
 | `/sweepalerts [on\|off]` | Opt in/out of Daily Sweep notifications |
 | `/contalerts [on\|off]` | Opt in/out of Daily Continuation notifications (separate from sweeps) |
-| `/sweeps` (or `/setups`) | List all active setups — sweeps and continuations (pair, direction, level(s), which continuation level is hit, expiry in WAT; invalidated continuations are listed separately) |
+| `/sweeps` (or `/setups`) | List all active setups — sweeps and continuations (pair, direction, level(s), which continuation level is hit, expiry in WAT) — only active setups; an invalidated one simply disappears |
 | `/sweepcheck [PAIR]` | Show the last two completed daily candles as the bot built them, and whether they form a sweep or continuation setup |
 | `/sweepscan` | Admin only: run the daily scan (both features) now |
 | `/help` | Full command list |
@@ -129,7 +129,11 @@ A Day 2 can match only one of the four patterns (the Day 1/Day 2 colour combinat
 not first swept Day 2's extreme. While a continuation is still at stage 0 (Level 1 not yet reached), if
 price trades beyond Day 2's **high** (BUY) or **low** (SELL) by *more than* `SWEEP_INVALIDATION_BUFFER_PIPS`
 (2 pips by default), the setup is marked `INVALIDATED`: a later retrace to Level 1 or Level 2 won't alert,
-and `/contalerts` subscribers get one short message with the swept level and the time in WAT. The check
+and `/contalerts` subscribers get one short message with the swept level, the price seen and *when it was
+detected* in WAT (after a restart, or when a setup is armed late, the sweep may have happened earlier, so the
+message never claims when it happened). The row keeps `invalidated_at` / `invalidated_price` for audit, but
+`/sweeps` no longer lists it. The threshold shown in `/sweeps` is Day 2's high **+** the buffer for a BUY and
+Day 2's low **−** the buffer for a SELL. The check
 runs before any stage advancement, and the status change is an atomic database claim
 (`ACTIVE → INVALIDATED` only at stage 0 and before Day 3 closes), so restarts, duplicate ticks and a
 simultaneous Level 1 tick can't produce two outcomes. Once Level 1 has fired the rule no longer applies:
