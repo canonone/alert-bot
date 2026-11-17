@@ -137,11 +137,17 @@ Day 2's low **−** the buffer for a SELL. The check
 runs before any stage advancement, and the status change is an atomic database claim
 (`ACTIVE → INVALIDATED` only at stage 0 and before Day 3 closes), so restarts, duplicate ticks and a
 simultaneous Level 1 tick can't produce two outcomes. Once Level 1 has fired the rule no longer applies:
-Level 2 stays live. The same test runs when a setup is armed at the 17:10 scan: if the 1H bars since Day 2
-closed (including the in-progress 17:00 bar), or failing that the latest price, already swept Day 2's
-extreme, the setup is not created and the scan logs why. Sweep setups are never invalidated. Expiry stays
-silent. (The "invalidation / SL idea" line in the alerts is the trade's stop — Day 2's low for a BUY — which
-is the opposite extreme.)
+Level 2 stays live. **Arming late.** At the normal 17:10 scan almost nothing has happened since Day 2 closed. A manual `/sweepscan`
+or a catch-up scan hours later is different, so a continuation is armed by **replaying the 1H bars since Day 2's
+close in order** (including the in-progress bar) with the live rule: Day 2's extreme swept while still at stage 0
+voids it (the setup is not created and the scan logs why); reaching Level 1 first moves it to stage 1, after
+which a later sweep no longer matters, then Level 2 to stage 2 (a merged zone completes at Level 1). A setup
+that comes out already at a later stage is stored at that stage and announced once as "reached earlier" with
+the 1H hour it happened in (`⚡ Level 1 was reached earlier — in the 02:00–03:00 WAT hour (high 159.613) —
+before the setup was armed.`), then keeps watching for what's left. Because the insert is the once-only claim, a
+rescan can't announce it again. A single 1H bar that both swept Day 2's extreme and reached Level 1 can't be
+ordered, so it voids (no alert is better than a wrong one). If the fetch has no bars since the close, the latest
+price is used for the sweep check instead, as before. Sweep setups are not replayed.
 
 Because a day's open is the previous day's close, Day 2 always opens at Day 1's close, so a gap
 between Day 1 and Day 2 can no longer occur and the "no gap" skip effectively never fires (only if
