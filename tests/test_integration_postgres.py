@@ -20,6 +20,7 @@ from sqlalchemy.pool import NullPool
 
 import app.db as db_module
 import app.services.daily_sweep_service as sm
+import app.services.smt_divergence_service as smt_module
 import app.services.users_service as users_module
 from app.models import DailySweepScanState, DailySweepSetup, SmtDivergenceLevel, User
 from app.services.daily_sweep_service import (
@@ -56,7 +57,7 @@ async def pg():
     Session = async_sessionmaker(engine, expire_on_commit=False)
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(db_module, "engine", engine)
-        for module in (db_module, sm, users_module):
+        for module in (db_module, sm, users_module, smt_module):
             mp.setattr(module, "SessionLocal", Session)
         try:
             await db_module.init_db()  # the real startup path: create_all + the idempotent ALTERs
@@ -613,5 +614,255 @@ def test_divergence_flag_is_added_to_an_existing_users_table_and_toggles():
             # independent of the other opt-ins
             await users.set_daily_sweep_alerts_enabled("a", True)
             assert await ids() == ["b"] and [u.chat_id for u in await users.find_daily_sweep_subscribers()] == ["a"]
+
+    run(body)
+
+
+# ── SMT divergence: the real SQL claims, restarts and races ─────────────────
+
+from test_daily_sweep import day_hours  # noqa: E402
+from test_smt_divergence import CLOSE as SMT_CLOSE, LEVEL_DAY as SMT_DAY, LEVELS as SMT_LEVELS, PIP as SMT_PIP, UNTIL as SMT_UNTIL  # noqa: E402
+from app.services.smt_divergence_service import SmtDivergenceService  # noqa: E402
+
+SMT_NOW = SMT_CLOSE + datetime.timedelta(minutes=12)
+SMT_T = SMT_CLOSE + datetime.timedelta(hours=2)  # the leader's touch
+MINUTE = datetime.timedelta(minutes=1)
+
+
+def _smt_candles():
+    return {"GBPUSD": day_hours(SMT_DAY, 1.2700, 1.2780, 1.2650, 1.2720),
+            "EURUSD": day_hours(SMT_DAY, 1.0780, 1.0850, 1.0720, 1.0800)}
+
+
+def _smt_service(now=SMT_NOW):
+    users = UsersService()
+    sent: list[tuple[str, str]] = []
+
+    async def send(chat_id, message):
+        sent.append((chat_id, message))
+
+    svc = SmtDivergenceService("unused-key", None, users, send)  # market_data=None: nothing can hit Twelve Data
+    clock = {"now": now}
+    svc.clock = lambda: clock["now"]
+    return svc, users, sent, clock
+
+
+async def _subscriber(Session, users):
+    async with Session() as session:
+        session.add(User(chat_id="s", is_approved=True))
+        await session.commit()
+    await users.set_divergence_alerts_enabled("s", True)
+
+
+async def _smt_rows(Session):
+    async with Session() as session:
+        rows = (await session.execute(select(SmtDivergenceLevel).order_by(SmtDivergenceLevel.side))).scalars().all()
+    return {row.side: row for row in rows}
+
+
+def _tick_price(pair, side, pips_beyond):
+    level = SMT_LEVELS[side][pair]
+    return level - pips_beyond * SMT_PIP if side == "LOW" else level + pips_beyond * SMT_PIP
+
+
+def test_smt_claims_are_atomic_and_their_time_conditions_hold_at_the_boundary():
+    async def body():
+        async with pg() as (engine, Session):
+            svc, users, sent, clock = _smt_service()
+            assert await svc.capture(_smt_candles(), SMT_DAY) is True
+            assert await svc.capture(_smt_candles(), SMT_DAY) is True  # a rescan: nothing new
+            rows = await _smt_rows(Session)
+            assert sorted(rows) == ["HIGH", "LOW"] and (rows["LOW"].status, rows["HIGH"].status) == ("ACTIVE", "ACTIVE")
+            assert (rows["LOW"].gbpusd_level, rows["LOW"].eurusd_level) == (1.2650, 1.0720)
+            assert (rows["HIGH"].gbpusd_level, rows["HIGH"].eurusd_level) == (1.2780, 1.0850)
+            assert rows["LOW"].trading_day == SMT_DAY and rows["LOW"].expires_at == SMT_UNTIL
+            assert await svc._count_rows(SMT_DAY) == 2 and await svc._count_rows(D(2026, 1, 1)) == 0
+            low = rows["LOW"].id
+
+            # a wrong expected status claims nothing
+            assert await svc._claim(low, "LEADER_TOUCHED", "CONFIRMED", {}) is False
+            deadline = SMT_T + 60 * MINUTE
+            leader = dict(leader_pair="GBPUSD", leader_touched_at=SMT_T, leader_price=1.2649, leader_touch_basis="tick", deadline_at=deadline)
+            assert await svc._claim(low, "ACTIVE", "LEADER_TOUCHED", leader) is True
+            assert await svc._claim(low, "ACTIVE", "LEADER_TOUCHED", leader) is False  # once
+            row = (await _smt_rows(Session))["LOW"]
+            assert (row.status, row.leader_pair, row.leader_touch_basis, row.deadline_at) == ("LEADER_TOUCHED", "GBPUSD", "tick", deadline)
+
+            # deadline_gt is strict (a laggard touch AT the deadline is too late), deadline_le inclusive
+            second = datetime.timedelta(seconds=1)
+            assert await svc._claim(low, "LEADER_TOUCHED", "CONFIRMED", {}, deadline_gt=deadline) is False
+            assert await svc._claim(low, "LEADER_TOUCHED", "DIVERGENCE", {}, deadline_le=deadline - second) is False
+            assert await svc._claim(low, "LEADER_TOUCHED", "CONFIRMED", {}, deadline_gt=deadline - second) is True
+            assert (await _smt_rows(Session))["LOW"].status == "CONFIRMED"
+            assert await svc._claim(low, "LEADER_TOUCHED", "DIVERGENCE", {}, deadline_le=deadline) is False  # already resolved
+
+            # inclusive at the deadline for the divergence claim; expires_le only once the day is over
+            high = rows["HIGH"].id
+            assert await svc._claim(high, "ACTIVE", "LEADER_TOUCHED", leader) is True
+            assert await svc._claim(high, "LEADER_TOUCHED", "DIVERGENCE", dict(resolved_at=deadline, laggard_best_price=1.0725), deadline_le=deadline) is True
+            row = (await _smt_rows(Session))["HIGH"]
+            assert (row.status, row.resolved_at, row.laggard_best_price) == ("DIVERGENCE", deadline, 1.0725)
+
+    run(body)
+
+
+def test_smt_flush_expire_select_and_load_helpers():
+    async def body():
+        async with pg() as (engine, Session):
+            svc, users, sent, clock = _smt_service()
+            await svc.capture(_smt_candles(), SMT_DAY)
+            rows = await _smt_rows(Session)
+            # the closest approach is only written while the window is open
+            assert await svc._flush_best(rows["LOW"].id, 1.0724) is False  # still ACTIVE
+            await svc._claim(rows["LOW"].id, "ACTIVE", "LEADER_TOUCHED", dict(leader_pair="GBPUSD", leader_touched_at=SMT_T, deadline_at=SMT_T + 60 * MINUTE))
+            assert await svc._flush_best(rows["LOW"].id, 1.0724) is True
+            assert (await _smt_rows(Session))["LOW"].laggard_best_price == 1.0724
+
+            open_rows = await svc._load_open_rows(SMT_NOW)
+            assert sorted((r.side, r.status) for r in open_rows) == [("HIGH", "ACTIVE"), ("LOW", "LEADER_TOUCHED")]
+            assert [r for r in open_rows if r.side == "LOW"][0].laggard_best == 1.0724  # restored after a restart
+            assert await svc._load_open_rows(SMT_UNTIL) == []  # nothing is open once the period is over
+
+            current = await svc._select_current(SMT_NOW)
+            assert sorted(r.side for r in current) == ["HIGH", "LOW"]
+            assert await svc._select_current(SMT_UNTIL) == []
+
+            # only ACTIVE rows expire (silently); the one with a leader is the timer's to resolve
+            assert await svc._expire_in_db(SMT_UNTIL - MINUTE) == []
+            assert await svc._expire_in_db(SMT_UNTIL) == [rows["HIGH"].id]
+            assert (await _smt_rows(Session))["HIGH"].status == "EXPIRED" and (await _smt_rows(Session))["LOW"].status == "LEADER_TOUCHED"
+            assert await svc._expire_in_db(SMT_UNTIL) == []  # idempotent
+            assert sent == []
+
+    run(body)
+
+
+def test_smt_full_lifecycle_on_real_rows_including_a_restart():
+    async def body():
+        async with pg() as (engine, Session):
+            svc, users, sent, clock = _smt_service()
+            await _subscriber(Session, users)
+            await svc.capture(_smt_candles(), SMT_DAY)
+
+            clock["now"] = SMT_T
+            await svc.check_tick("GBPUSD", _tick_price("GBPUSD", "LOW", 1), None)  # the leader touches its PDL
+            for minutes, pips_short in ((10, 6), (20, 2.5), (30, 5)):  # EURUSD wanders, closest 2.5 pips short
+                clock["now"] = SMT_T + minutes * MINUTE
+                await svc.check_tick("EURUSD", _tick_price("EURUSD", "LOW", -pips_short), None)
+            clock["now"] = SMT_T + 40 * MINUTE
+            await svc.check_deadlines()  # persists the closest approach
+            row = (await _smt_rows(Session))["LOW"]
+            assert (row.status, row.leader_pair, row.leader_touch_basis, row.deadline_at) == ("LEADER_TOUCHED", "GBPUSD", "tick", SMT_T + 60 * MINUTE)
+            assert row.laggard_best_price == pytest.approx(1.0720 + 2.5 * SMT_PIP)
+
+            # restart: a new instance resumes from the rows
+            revived, _, sent2, clock2 = _smt_service(now=SMT_T + 50 * MINUTE)
+            await revived.bootstrap()
+            assert revived.active_symbols() == {"GBPUSD", "EURUSD"}
+            clock2["now"] = SMT_T + 61 * MINUTE
+            await revived.check_deadlines()
+            assert len(sent2) == 1 and "SMT DIVERGENCE — PDL" in sent2[0][1]
+            assert "closest approach 2.5 pips from the level" in sent2[0][1]
+            row = (await _smt_rows(Session))["LOW"]
+            assert (row.status, row.laggard_best_price, row.resolved_at) == ("DIVERGENCE", pytest.approx(1.0720 + 2.5 * SMT_PIP), SMT_T + 61 * MINUTE)
+            await revived.check_deadlines()
+            await svc.check_deadlines()  # the OLD instance still has the row cached: its claim loses, it sends nothing
+            assert len(sent2) == 1 and sent == []
+            assert (await _smt_rows(Session))["HIGH"].status == "ACTIVE"  # the other side was never touched
+
+    run(body)
+
+
+def test_smt_late_touch_on_a_tick_before_the_timer_is_worded_as_such():
+    async def body():
+        async with pg() as (engine, Session):
+            svc, users, sent, clock = _smt_service()
+            await _subscriber(Session, users)
+            await svc.capture(_smt_candles(), SMT_DAY)
+            clock["now"] = SMT_T
+            await svc.check_tick("EURUSD", _tick_price("EURUSD", "HIGH", 1), None)  # EURUSD leads the HIGH case
+            clock["now"] = SMT_T + 67 * MINUTE  # 7 minutes after its window closed; the timer hasn't run
+            await svc.check_tick("GBPUSD", _tick_price("GBPUSD", "HIGH", 1), None)
+            row = (await _smt_rows(Session))["HIGH"]
+            assert row.status == "DIVERGENCE" and row.laggard_touched_at == SMT_T + 67 * MINUTE
+            assert len(sent) == 1 and "touched 7 min after the window closed" in sent[0][1] and "did not touch" not in sent[0][1]
+            await svc.check_deadlines()
+            assert len(sent) == 1
+
+    run(body)
+
+
+def test_smt_arming_late_stores_the_replayed_state_and_never_announces_twice():
+    async def body():
+        async with pg() as (engine, Session):
+            svc, users, sent, clock = _smt_service(now=SMT_CLOSE + datetime.timedelta(hours=3))
+            await _subscriber(Session, users)
+            from test_smt_divergence import bar, hour
+
+            candles = _smt_candles()
+            candles["GBPUSD"] += [bar("LOW", "GBPUSD", hour(0), 2)]  # GBPUSD took its PDL in the first hour
+            candles["EURUSD"] += [bar("LOW", "EURUSD", hour(0), -6), bar("LOW", "EURUSD", hour(1), -4)]
+            await svc.capture(candles, SMT_DAY)
+            row = (await _smt_rows(Session))["LOW"]
+            assert (row.status, row.detected_late, row.leader_touch_basis) == ("DIVERGENCE", True, "hour")
+            assert len(sent) == 1 and "⚡ Detected late" in sent[0][1]
+            await svc.capture(candles, SMT_DAY)  # the catch-up / a rescan hits the unique constraint
+            assert len(sent) == 1 and len(await _smt_rows(Session)) == 2
+            fresh, _, _, _ = _smt_service(now=SMT_CLOSE + datetime.timedelta(hours=3))
+            await fresh.bootstrap()
+            assert {r.side for r in fresh._rows.values()} == {"HIGH"}  # the resolved side isn't watched again
+
+    run(body)
+
+
+def test_smt_two_instances_cannot_both_announce_one_deadline():
+    async def body():
+        async with pg() as (engine, Session):
+            a, users, sent_a, clock_a = _smt_service()
+            await _subscriber(Session, users)
+            await a.capture(_smt_candles(), SMT_DAY)
+            clock_a["now"] = SMT_T
+            await a.check_tick("GBPUSD", _tick_price("GBPUSD", "LOW", 1), None)
+            b, _, sent_b, clock_b = _smt_service()
+            await b.bootstrap()
+            clock_a["now"] = clock_b["now"] = SMT_T + 61 * MINUTE
+            await asyncio.gather(a.check_deadlines(), b.check_deadlines())
+            assert len(sent_a) + len(sent_b) == 1
+            assert (await _smt_rows(Session))["LOW"].status == "DIVERGENCE"
+
+    run(body)
+
+
+def test_smt_tick_versus_timer_race_has_one_outcome_on_real_rows():
+    async def body():
+        async with pg() as (engine, Session):
+            # a fresh level day each round, so each round is a new row to fight over
+            for round_no in range(4):
+                day = SMT_DAY + datetime.timedelta(days=7 * round_no)  # Tuesdays
+                close = sm.trading_day_bounds(day)[1]  # (rounds 1+ are after the US clocks change: 22:00 UTC, not 21:00)
+                svc, users, sent_tick, clock_tick = _smt_service(now=close + 12 * MINUTE)
+                if round_no == 0:
+                    await _subscriber(Session, users)
+                candles = {"GBPUSD": day_hours(day, 1.2700, 1.2780, 1.2650, 1.2720), "EURUSD": day_hours(day, 1.0780, 1.0850, 1.0720, 1.0800)}
+                await svc.capture(candles, day)
+                touch = close + datetime.timedelta(hours=2)
+                clock_tick["now"] = touch
+                await svc.check_tick("GBPUSD", _tick_price("GBPUSD", "LOW", 1), None)
+                timer_svc, _, sent_timer, clock_timer = _smt_service(now=touch)
+                await timer_svc.bootstrap()
+                deadline = touch + 60 * MINUTE
+                clock_tick["now"] = deadline - datetime.timedelta(seconds=1)  # the laggard touches just BEFORE the deadline
+                clock_timer["now"] = deadline + datetime.timedelta(seconds=1)  # the timer fires just AFTER it
+                first, second = (
+                    (svc.check_tick("EURUSD", _tick_price("EURUSD", "LOW", 1), None), timer_svc.check_deadlines())
+                    if round_no % 2 == 0
+                    else (timer_svc.check_deadlines(), svc.check_tick("EURUSD", _tick_price("EURUSD", "LOW", 1), None))
+                )
+                await asyncio.gather(first, second)
+                async with Session() as session:
+                    row = (await session.execute(select(SmtDivergenceLevel).where(SmtDivergenceLevel.trading_day == day, SmtDivergenceLevel.side == "LOW"))).scalar_one()
+                assert row.status in ("CONFIRMED", "DIVERGENCE")
+                messages = len(sent_tick) + len(sent_timer)
+                assert messages == (1 if row.status == "DIVERGENCE" else 0)  # exactly one outcome, and only a divergence speaks
 
     run(body)
