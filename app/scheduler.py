@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 from telegram.ext import Application, ContextTypes
 
 from app.services.daily_sweep_service import SCAN_RETRY_DELAY_SECONDS, DailySweepService
+from app.services.smt_divergence_service import DEADLINE_CHECK_INTERVAL_SECONDS, SmtDivergenceService
 from app.services.price_alert_service import PriceAlertService
 from app.services.users_service import UsersService
 from app.telegram_bot import TelegramBotService
@@ -18,6 +19,7 @@ def register_jobs(
     telegram_bot: TelegramBotService,
     users_service: UsersService,
     daily_sweep_service: DailySweepService | None = None,
+    smt_divergence_service: SmtDivergenceService | None = None,
 ) -> None:
     async def run_daily_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("[DailyCleanup] Running daily alert cleanup at 10 PM WAT")
@@ -106,3 +108,27 @@ def register_jobs(
             days=(1, 2, 3, 4, 5),
         )
         logger.info("[Scheduler] Daily Sweep scan registered (17:10 America/New_York, Mon-Fri)")
+
+    if smt_divergence_service is not None:
+        async def check_smt_deadlines(context: ContextTypes.DEFAULT_TYPE) -> None:
+            # Windows must close even when no tick arrives, so this runs on its own clock, not on price ticks
+            try:
+                await smt_divergence_service.check_deadlines()
+            except Exception as error:
+                logger.error(f"[SmtDivergence] Deadline check failed: {error}")
+
+        async def catch_up_smt_levels(context: ContextTypes.DEFAULT_TYPE) -> None:
+            try:
+                result = await smt_divergence_service.catch_up()
+            except Exception as error:
+                logger.error(f"[SmtDivergence] Catch-up failed: {error}")
+                return
+            if result:
+                logger.info(f"[SmtDivergence] Catch-up: {result}")
+
+        application.job_queue.run_repeating(
+            check_smt_deadlines, interval=DEADLINE_CHECK_INTERVAL_SECONDS, first=30
+        )
+        # After the Daily Sweep catch-up has had its chance to start (it feeds these levels when it runs)
+        application.job_queue.run_once(catch_up_smt_levels, when=45)
+        logger.info(f"[Scheduler] SMT divergence deadline check registered (every {DEADLINE_CHECK_INTERVAL_SECONDS}s)")

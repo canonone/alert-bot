@@ -42,6 +42,7 @@ class TelegramBotService:
         self.bot: Bot | None = None
         self.finnhub_price_service: Any = None
         self.daily_sweep_service: Any = None
+        self.smt_divergence_service: Any = None
 
         # Strong refs to fire-and-forget tasks (manual sweep scans) so they aren't garbage collected
         self._background_tasks: set[asyncio.Task] = set()
@@ -94,6 +95,9 @@ class TelegramBotService:
             if command == "/sweepscan":
                 await self._handle_sweepscan(chat_id)
                 return
+            if command == "/divscan":
+                await self._handle_divscan(chat_id)
+                return
 
         # All other commands require approval first
         user = await self.users_service.find_by_chat_id(chat_id)
@@ -131,6 +135,10 @@ class TelegramBotService:
             await self._handle_sweeps(chat_id)
         elif command == "/sweepcheck":
             await self._handle_sweepcheck(chat_id, parts)
+        elif command == "/divalerts":
+            await self._handle_divalerts(chat_id, parts)
+        elif command in ("/divergence", "/smt"):
+            await self._handle_divergence(chat_id)
 
     # ── /start ────────────────────────────────────────────────────
 
@@ -514,6 +522,52 @@ class TelegramBotService:
             message += f"\n\nNo usable data for: {', '.join(report.retry_pairs)}"
         await self.send_message_to_user(chat_id, message)
 
+    # ── SMT divergence (GBPUSD / EURUSD) ──────────────────────────
+
+    async def _smt_unavailable(self, chat_id: str) -> bool:
+        if self.smt_divergence_service is None:
+            await self.send_message_to_user(chat_id, "❌ The SMT divergence feature is not configured on this server.")
+            return True
+        return False
+
+    async def _handle_divalerts(self, chat_id: str, parts: list[str]) -> None:
+        if await self._smt_unavailable(chat_id):
+            return
+        if len(parts) != 2 or parts[1].lower() not in ("on", "off"):
+            await self.send_message_to_user(
+                chat_id, "❌ Usage: <code>/divalerts on</code> or <code>/divalerts off</code>"
+            )
+            return
+        enabled = parts[1].lower() == "on"
+        await self.users_service.set_divergence_alerts_enabled(chat_id, enabled)
+        status = "enabled ✅" if enabled else "disabled ❌"
+        await self.send_message_to_user(chat_id, f"SMT divergence alerts {status}.")
+
+    async def _handle_divergence(self, chat_id: str) -> None:
+        if await self._smt_unavailable(chat_id):
+            return
+        await self.send_message_to_user(chat_id, await self.smt_divergence_service.get_status_message())
+
+    async def _handle_divscan(self, chat_id: str) -> None:
+        if await self._smt_unavailable(chat_id):
+            return
+        await self.send_message_to_user(
+            chat_id, "🔄 Recording the GBPUSD / EURUSD levels now (two Twelve Data requests)…"
+        )
+        # Two spaced requests: don't hold up the other Telegram updates while they run
+        task = asyncio.create_task(self._run_manual_smt_capture(chat_id))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _run_manual_smt_capture(self, chat_id: str) -> None:
+        try:
+            result = await self.smt_divergence_service.capture_now()
+        except Exception as error:
+            logger.error(f"Manual SMT level capture failed: {error}")
+            await self.send_message_to_user(chat_id, f"❌ Level capture failed: {html.escape(str(error))}")
+            return
+        await self.send_message_to_user(chat_id, f"✅ {html.escape(result)}")
+
     # ── /help ─────────────────────────────────────────────────────
 
     async def _handle_help(self, chat_id: str) -> None:
@@ -548,6 +602,10 @@ class TelegramBotService:
             "<code>/contalerts [on|off]</code> — continuation notifications (separate from sweeps)\n"
             "Same scan, same <code>/sweeps</code> and <code>/sweepcheck</code> commands\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>🔀 SMT Divergence</b> (GBPUSD / EURUSD)\n\n"
+            "<code>/divalerts [on|off]</code> — divergence notifications\n"
+            "<code>/divergence</code> (or <code>/smt</code>) — watched PDH/PDL levels and where each side stands\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
             "🔴 SL · 🟢 TP · 🎯 TARGET\n"
             "Real-time price alerts via live feed ⚡"
         )
@@ -559,7 +617,8 @@ class TelegramBotService:
                 "<code>/gencode [N]</code> — generate invite codes\n"
                 "<code>/listcodes</code> — view all codes\n"
                 "<code>/revokecode [CODE]</code> — delete a code\n"
-                "<code>/sweepscan</code> — run the Daily Sweep + Continuation scan now"
+                "<code>/sweepscan</code> — run the Daily Sweep + Continuation scan now\n"
+                "<code>/divscan</code> — record the GBPUSD / EURUSD SMT levels now"
             )
 
         await self.send_message_to_user(chat_id, msg)
