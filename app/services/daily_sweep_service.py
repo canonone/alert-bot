@@ -1065,6 +1065,10 @@ class DailySweepService:
         self.get_last_price: Callable[[str], tuple[float, datetime.datetime] | None] = lambda symbol: None
         # Monotonic time of the latest Twelve Data request, so every request respects the spacing
         self._last_td_request_at = float("-inf")
+        # Other features that reuse the candles this scan already fetched (no extra Twelve Data requests).
+        # Called as listener(pair, candles_1h, expected_day, now) right after each successful fetch. They MUST be
+        # cheap and synchronous (spawn a task for real work); a listener that raises is logged and ignored.
+        self.candle_listeners: list[Callable[[str, list[dict], datetime.date, datetime.datetime], None]] = []
 
     @property
     def scan_running(self) -> bool:
@@ -1242,6 +1246,8 @@ class DailySweepService:
             logger.warning(f"[DailySweep] No candle data returned for {pair}")
             return PairScan(pair, "nodata")
 
+        self._notify_candle_listeners(pair, candles_1h, expected_day)
+
         now = self.clock()
         usable = usable_daily_candles(aggregate_1h_to_daily(candles_1h, now, min_daily_bars_for(pair)), pair)
         for label, candle in zip(("Day 1", "Day 2"), usable[-2:] if len(usable) >= 2 else usable):
@@ -1382,6 +1388,14 @@ class DailySweepService:
         message = format_continuation_hit(setup, last.price, self.clock(), hit, earlier_note=note)
         logger.info(f"[DailySweep] {setup.pair} {setup.direction} setup #{setup.id}: announcing levels reached before arming")
         await self._broadcast(message, setup.kind)
+
+    def _notify_candle_listeners(self, pair: str, candles_1h: list[dict], expected_day: datetime.date) -> None:
+        """A failing listener must never break or delay the sweep scan: each call is isolated and logged."""
+        for listener in self.candle_listeners:
+            try:
+                listener(pair, candles_1h, expected_day, self.clock())
+            except Exception as error:
+                logger.error(f"[DailySweep] Candle listener {getattr(listener, '__qualname__', listener)} failed for {pair}: {error}")
 
     async def _store_setup(
         self,
