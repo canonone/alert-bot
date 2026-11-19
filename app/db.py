@@ -29,6 +29,7 @@ async def init_db() -> None:
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_sweep_alerts_enabled BOOLEAN NOT NULL DEFAULT false",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_continuation_alerts_enabled "
             "BOOLEAN NOT NULL DEFAULT false",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS divergence_alerts_enabled BOOLEAN NOT NULL DEFAULT false",
             "ALTER TABLE daily_sweep_setups ADD COLUMN IF NOT EXISTS kind VARCHAR(16) NOT NULL DEFAULT 'SWEEP'",
             "ALTER TABLE daily_sweep_setups ADD COLUMN IF NOT EXISTS level2 NUMERIC(18, 6)",
             "ALTER TABLE daily_sweep_setups ADD COLUMN IF NOT EXISTS stage INTEGER NOT NULL DEFAULT 0",

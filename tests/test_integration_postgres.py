@@ -21,7 +21,7 @@ from sqlalchemy.pool import NullPool
 import app.db as db_module
 import app.services.daily_sweep_service as sm
 import app.services.users_service as users_module
-from app.models import DailySweepScanState, DailySweepSetup, User
+from app.models import DailySweepScanState, DailySweepSetup, SmtDivergenceLevel, User
 from app.services.daily_sweep_service import (
     ACTIVE,
     EXPIRED,
@@ -111,7 +111,7 @@ def test_init_db_idempotent_on_empty_and_old_schema():
                 cols = {r[0] for r in await conn.execute(text(
                     "select column_name from information_schema.columns where table_schema = current_schema() "
                     "and table_name in ('users','daily_sweep_setups')"))}
-            assert {"daily_sweep_alerts_enabled", "daily_continuation_alerts_enabled", "kind", "level2", "stage"} <= cols
+            assert {"daily_sweep_alerts_enabled", "daily_continuation_alerts_enabled", "divergence_alerts_enabled", "kind", "level2", "stage"} <= cols
 
         # OLD schema: users without the new flags, daily_sweep_setups without kind/level2/stage, with rows
         async with pg() as (engine, Session):
@@ -550,5 +550,68 @@ def test_rerunning_a_scan_does_not_announce_an_earlier_hit_twice():
                 second = await svc.run_scan()  # e.g. the catch-up scan or a second /sweepscan
                 assert [r.status for r in second.results] == ["duplicate"]
                 assert sent == []
+
+    run(body)
+
+
+# ── SMT divergence: the table, its unique constraint and the users column ───
+
+def _smt_row(day=D(2026, 10, 27), side="LOW", **overrides):
+    values = dict(trading_day=day, side=side, gbpusd_level=1.25, eurusd_level=1.05, status="ACTIVE",
+                  expires_at=utc(2026, 10, 28, 21))
+    values.update(overrides)
+    return SmtDivergenceLevel(**values)
+
+
+def test_smt_table_unique_constraint_and_defaults():
+    async def body():
+        async with pg() as (engine, Session):
+            async with Session() as session:
+                session.add_all([_smt_row(side="LOW"), _smt_row(side="HIGH"), _smt_row(day=D(2026, 10, 28), side="LOW")])
+                await session.commit()
+            async with Session() as session:
+                session.add(_smt_row(side="LOW"))  # same (trading_day, side)
+                with pytest.raises(IntegrityError) as excinfo:
+                    await session.commit()
+            assert "uq_smt_day_side" in str(excinfo.value.orig)
+            async with Session() as session:
+                rows = (await session.execute(select(SmtDivergenceLevel).order_by(SmtDivergenceLevel.id))).scalars().all()
+            assert len(rows) == 3
+            first = rows[0]
+            assert (first.status, first.detected_late, first.leader_pair, first.deadline_at) == ("ACTIVE", False, None, None)
+            assert first.created_at is not None
+            # the longest status fits the column
+            async with engine.begin() as conn:
+                await conn.execute(text("UPDATE smt_divergence_levels SET status = 'LEADER_TOUCHED' WHERE id = :i"), {"i": first.id})
+
+    run(body)
+
+
+def test_divergence_flag_is_added_to_an_existing_users_table_and_toggles():
+    async def body():
+        async with pg() as (engine, Session):
+            async with engine.begin() as conn:  # an existing deployment's users table, before the flag existed
+                await conn.execute(text("ALTER TABLE users DROP COLUMN divergence_alerts_enabled"))
+            await db_module.init_db()
+            await db_module.init_db()  # idempotent
+            users = UsersService()
+            async with Session() as session:
+                session.add_all([User(chat_id="a", is_approved=True), User(chat_id="b", is_approved=True),
+                                 User(chat_id="c", is_approved=False)])
+                await session.commit()
+
+            async def ids():
+                return sorted(u.chat_id for u in await users.find_divergence_subscribers())
+
+            assert await ids() == []  # default false for the existing rows
+            await users.set_divergence_alerts_enabled("a", True)
+            await users.set_divergence_alerts_enabled("c", True)  # not approved: never a subscriber
+            assert await ids() == ["a"]
+            await users.set_divergence_alerts_enabled("b", True)
+            await users.set_divergence_alerts_enabled("a", False)
+            assert await ids() == ["b"]
+            # independent of the other opt-ins
+            await users.set_daily_sweep_alerts_enabled("a", True)
+            assert await ids() == ["b"] and [u.chat_id for u in await users.find_daily_sweep_subscribers()] == ["a"]
 
     run(body)

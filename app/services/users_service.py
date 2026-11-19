@@ -124,6 +124,22 @@ class UsersService:
             )
             return list(result.scalars().all())
 
+    # ── SMT divergence alert opt-in ───────────────────────────────
+
+    async def set_divergence_alerts_enabled(self, chat_id: str, enabled: bool) -> None:
+        async with SessionLocal() as session:
+            await session.execute(
+                update(User).where(User.chat_id == chat_id).values(divergence_alerts_enabled=enabled)
+            )
+            await session.commit()
+
+    async def find_divergence_subscribers(self) -> list[User]:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(User).where(User.divergence_alerts_enabled.is_(True), User.is_approved.is_(True))
+            )
+            return list(result.scalars().all())
+
     async def find_digest_subscribers(self) -> list[User]:
         """Approved users opted into at least one of Daily Sweep / Daily Continuation."""
         async with SessionLocal() as session:

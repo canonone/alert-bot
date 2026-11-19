@@ -47,6 +47,8 @@ class User(Base):
     daily_continuation_alerts_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false"
     )
+    # Opt-in flag for SMT divergence notifications (see SmtDivergenceService)
+    divergence_alerts_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime.datetime] = mapped_column(
@@ -139,6 +141,43 @@ class DailySweepScanState(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class SmtDivergenceLevel(Base):
+    """One side (LOW = previous-day lows, HIGH = previous-day highs) of one monitored period for the GBPUSD/EURUSD
+    SMT divergence check. See SmtDivergenceService for the state machine."""
+
+    __tablename__ = "smt_divergence_levels"
+    __table_args__ = (UniqueConstraint("trading_day", "side", name="uq_smt_day_side"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # The COMPLETED trading day (labelled by the New York date it closes on) whose high/low are the levels;
+    # the period monitored runs from that close until the next trading day closes (expires_at).
+    trading_day: Mapped[datetime.date] = mapped_column(Date)
+    side: Mapped[str] = mapped_column(String(4))  # "LOW" | "HIGH"
+    gbpusd_level: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
+    eurusd_level: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
+
+    # ACTIVE -> LEADER_TOUCHED -> CONFIRMED | DIVERGENCE;  ACTIVE -> EXPIRED  (every step an atomic claim)
+    status: Mapped[str] = mapped_column(String(16), index=True, default="ACTIVE")
+
+    leader_pair: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    leader_touched_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    leader_price: Mapped[float | None] = mapped_column(Numeric(18, 6, asdecimal=False), nullable=True)
+    # How well the touch time is known: "tick" (observed live), "hour" (from a 1H bar) or "detected" (when we noticed)
+    leader_touch_basis: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    deadline_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    resolved_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    laggard_touched_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    laggard_price: Mapped[float | None] = mapped_column(Numeric(18, 6, asdecimal=False), nullable=True)  # at resolution
+    # The laggard's closest approach to its level while the window was open (lowest for LOW, highest for HIGH)
+    laggard_best_price: Mapped[float | None] = mapped_column(Numeric(18, 6, asdecimal=False), nullable=True)
+    detected_late: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class InviteCode(Base):
