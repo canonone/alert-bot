@@ -84,6 +84,9 @@ Tables are created automatically on first run.
 | `/sweeps` (or `/setups`) | List all active setups — sweeps and continuations (pair, direction, level(s), which continuation level is hit, expiry in WAT) — only active setups; an invalidated one simply disappears |
 | `/sweepcheck [PAIR]` | Show the last two completed daily candles as the bot built them, and whether they form a sweep or continuation setup |
 | `/sweepscan` | Admin only: run the daily scan (both features) now |
+| `/divalerts [on\|off]` | Opt in/out of SMT divergence notifications (GBPUSD / EURUSD) |
+| `/divergence` (or `/smt`) | Show the GBPUSD / EURUSD PDH/PDL being watched and where each side stands (waiting, leader touched + deadline, confirmed, divergence sent), times in WAT |
+| `/divscan` | Admin only: record the GBPUSD / EURUSD levels now (two Twelve Data requests) |
 | `/help` | Full command list |
 
 ### Alert Types
@@ -155,9 +158,54 @@ Day 1 closed exactly on its own high/low, or when an open fell back to the first
 kept as a harmless guard. `/sweepcheck` shows `open = previous close` per candle, and both values
 when the first 1H bar's open differs by more than 2 pips.
 
+### SMT Divergence Alerts (GBPUSD / EURUSD)
+Requires `TWELVE_DATA_API_KEY` (like Daily Sweep; without it the feature is disabled with a startup warning).
+Opt in with `/divalerts on` (approved users only).
+
+GBPUSD and EURUSD are positively correlated, so they should take out their previous-day liquidity at about the
+same time. At each trading-day close (17:00 America/New_York) the previous-day high (PDH) and low (PDL) of both
+pairs are recorded from the same synthetic daily candles Daily Sweep builds (not Twelve Data's `1day`). They are
+watched from that close until the **next** trading day closes (Friday's levels run through Monday's close). The
+two sides are independent: a LOW case (both should trade to their PDL, price ≤ PDL) and a HIGH case (both to
+their PDH, price ≥ PDH). A day can fire one, both or neither, and each side fires at most once.
+
+```
+ACTIVE ──leader touches──▶ LEADER_TOUCHED ──laggard touches in time──▶ CONFIRMED   (silent, logged)
+  │  └─ other pair already past its level ─▶ CONFIRMED                └─deadline passes──▶ DIVERGENCE (one alert)
+  └─ day closes, nobody touched ─▶ EXPIRED (silent)
+```
+
+- The first pair to touch its level is the **leader** (either pair can lead). That starts a 60-minute window; if the
+  other pair (the **laggard**) touches its own level before the deadline the pair is in sync and nothing is sent.
+  If the deadline passes first it is a **divergence**. The deadline is `min(touch + 60 min, the day's close)`.
+- "Touch" is any touch or break, no buffer by default (see the settings below). Weekend quotes are ignored.
+- **The alert** (one per divergence, no trade advice) gives the side (PDL/PDH), the leader, its level, when it
+  touched (WAT) and the price, the laggard, its level, its current price and distance in pips, **its closest
+  approach to the level during the window**, and the window length, plus a line stating what happened ("GBPUSD
+  took its PDL, EURUSD held above its PDL after 60 min"). A closest approach within `NEAR_MISS_PIPS` (2) is
+  **annotated, never suppressed**: it may be a feed difference between the Twelve Data levels and the Finnhub
+  ticks. If the laggard's own tick touched its level *after* the deadline but before the timer ran, the alert says
+  it "touched N min after the window closed" instead of "did not touch".
+- **Levels** are recorded by the 17:10 New York Daily Sweep scan, reusing the GBPUSD and EURUSD candles it already
+  fetched (no extra Twelve Data requests); the scan's own 15-minute retry covers a lagging pair, and a startup
+  catch-up (or `/divscan`, which fetches just the two pairs with the same request spacing and never while a sweep
+  scan is running) covers a missed scan. Because the scan is alphabetical, GBPUSD is reached a couple of minutes in,
+  so the first minutes of the period are covered by replaying the 1H bars since the close.
+- **Arming late** (the 17:10 scan itself, a catch-up, `/divscan`): the 1H bars since the close are replayed in order.
+  A 1H bar only gives the hour a touch happened in, so the window is judged conservatively from the *end* of the
+  leader's hour (alerts are never early, only possibly late): both pairs touching in the same or adjacent hour is
+  treated as in sync (silent); a laggard two or more hours later, or a leader whose window has already passed, sends
+  the divergence immediately, labelled "⚡ Detected late" with the hour (never an exact time that wasn't observed).
+- **Deadlines don't depend on ticks:** a job checks pending windows every 60 seconds (so an alert can be up to a
+  minute after the exact deadline) and closes untouched rows after the day ends. All state lives in Postgres
+  (`smt_divergence_levels`) and is rebuilt on startup, including the laggard's closest approach (saved when the row
+  resolves and every minute while a window is open). Every state change is an atomic conditional `UPDATE`, and a
+  message is only sent by the caller that won it, so restarts, duplicate ticks and the tick-vs-timer race can't
+  produce two messages.
+
 ### Margins and settings
 Small feed differences between Twelve Data and FOREX.com shouldn't create or break a setup, so the
-patterns carry minimum margins. A pip is 0.0001 (0.01 for JPY pairs, 0.1 for XAUUSD). Each setting is
+patterns carry minimum margins (and the SMT divergence settings are listed here too). A pip is 0.0001 (0.01 for JPY pairs, 0.1 for XAUUSD). Each setting is
 a default constant in `app/services/daily_sweep_service.py` with a per-pair override dict:
 
 | Setting | Default | Meaning |
@@ -165,6 +213,10 @@ a default constant in `app/services/daily_sweep_service.py` with a per-pair over
 | `MIN_BEYOND_PIPS` (`PAIR_MIN_BEYOND_PIPS`) | 3 | A continuation's Day 2 **close** must be at least this far beyond Day 1's high (BUY) / low (SELL); a sweep's Day 2 **wick** must go at least this far beyond Day 1's high (SELL) / low (BUY). |
 | `OPPOSITE_SIDE_BUFFER_PIPS` (`PAIR_OPPOSITE_SIDE_BUFFER_PIPS`) | 2 | Day 2 only counts as *not having taken* Day 1's opposite extreme if it stayed at least this many pips away from it (sweep SELL: low ≥ Day 1 low + buffer; sweep BUY: high ≤ Day 1 high − buffer; continuation BUY: low ≥ Day 1 low + buffer; continuation SELL: high ≤ Day 1 high − buffer). Twelve Data's extremes can sit a fraction of a pip inside FOREX.com's, so a near-touch counts as a touch. Exactly the buffer counts as clear; anything closer is taken. |
 | `SWEEP_INVALIDATION_BUFFER_PIPS` (`PAIR_SWEEP_INVALIDATION_BUFFER_PIPS`) | 2 | Continuations only: price must exceed Day 2's high (BUY) / low (SELL) by MORE than this many pips, before Level 1, to void the setup. Exactly the buffer does not count. |
+| `DIVERGENCE_WAIT_MINUTES` | 60 | SMT divergence: how long the laggard has, after the leader touches its level, to touch its own (capped by the day's close). |
+| `TOUCH_BUFFER_PIPS` (`PAIR_TOUCH_BUFFER_PIPS`) | 0 | SMT divergence: tolerance that widens the touch zone toward price (price within this many pips of the level counts as a touch). 0 = a plain touch or break. |
+| `NEAR_MISS_PIPS` (`PAIR_NEAR_MISS_PIPS`) | 2 | SMT divergence: a laggard whose closest approach stayed within this many pips of its level gets a "may be a feed difference" note on the alert (it is never suppressed). |
+| `DEADLINE_CHECK_INTERVAL_SECONDS` | 60 | SMT divergence: how often the scheduler resolves windows whose deadline has passed. |
 | `MIN_BODY_PIPS` (`PAIR_MIN_BODY_PIPS`) | 2 | A day is only bullish/bearish if `|close − open|` is at least this. Anything smaller is a doji and matches neither pattern. |
 | `MERGE_LEVELS_PIPS` (`PAIR_MERGE_LEVELS_PIPS`) | 3 | When a continuation's Level 1 and Level 2 are within this many pips, they are one zone: ONE combined alert when Level 1 is reached (with a note that the levels are only X pips apart), and the setup is complete. `/sweepcheck`, `/sweeps` and the digest show "single alert (levels X pips apart)". |
 
@@ -212,7 +264,8 @@ inherits that difference. High, low and close can also be a few pips off (typica
 ## Upgrading
 
 The app creates missing tables on startup (so `daily_sweep_setups` appears automatically) and adds
-the `users.daily_sweep_alerts_enabled` column if it's missing. It also adds the continuation columns
+the `users.daily_sweep_alerts_enabled` and `users.divergence_alerts_enabled` columns if they're missing, and creates
+the `smt_divergence_levels` table (SMT divergence) automatically. It also adds the continuation columns
 (including `invalidated_at` / `invalidated_price`) and widens `daily_sweep_setups.status` from `VARCHAR(10)` to
 `VARCHAR(16)` so the `INVALIDATED` status fits (a no-rewrite change). All of this is idempotent and happens
 on startup; nothing is ever dropped at runtime, and there is no manual SQL for this upgrade.
@@ -250,10 +303,11 @@ app/
 │   ├── price_alert_service.py     # Alert CRUD + trigger logic
 │   ├── invite_service.py          # Invite-code generation/redemption
 │   ├── daily_sweep_service.py     # Daily Sweep: 17:00-NY daily candles, pattern scan, live level alerts
+│   ├── smt_divergence_service.py  # SMT divergence (GBPUSD/EURUSD): PDH/PDL levels, wait-window state machine, alerts
 │   └── finnhub_price_service.py   # Live Finnhub WebSocket feed
 ├── telegram_bot.py                # All bot commands + message routing
 ├── webhook.py                     # FastAPI app exposing POST /webhook/<token> (production only)
-├── scheduler.py                   # Friday cleanup + alert-ID reset jobs, Daily Sweep scan (17:10 NY)
+├── scheduler.py                   # Friday cleanup + alert-ID reset jobs, Daily Sweep scan (17:10 NY), SMT deadline check (60 s)
 ├── db.py / models.py              # SQLAlchemy async models + engine
 ├── config.py                      # Environment variable loading
 └── main.py                        # Entrypoint — polling (dev) / FastAPI+uvicorn webhook (prod)

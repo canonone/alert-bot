@@ -20,6 +20,7 @@ class FinnhubPriceService:
         price_alert_service: PriceAlertService,
         send_message: SendMessage,
         daily_sweep_service: Any = None,
+        smt_divergence_service: Any = None,
     ) -> None:
         self.price_alert_service = price_alert_service
         self.send_message = send_message
@@ -28,6 +29,9 @@ class FinnhubPriceService:
         # Optional Daily Sweep feature — ticks are forwarded to it when configured, and every pair
         # with an ACTIVE setup is subscribed even if nobody has a normal price alert on it
         self.daily_sweep_service = daily_sweep_service
+        # Optional SMT divergence feature (GBPUSD / EURUSD) — same idea: it gets every tick, and its pairs are
+        # subscribed while any of its levels is still being watched
+        self.smt_divergence_service = smt_divergence_service
 
         self.ws: Any | None = None
         self.subscribed_symbols: set[str] = set()
@@ -90,7 +94,8 @@ class FinnhubPriceService:
     async def _subscribe_to_active_symbols(self) -> None:
         grouped = await self.price_alert_service.get_active_alerts_grouped_by_symbol()
         sweep_symbols = self.daily_sweep_service.active_symbols() if self.daily_sweep_service is not None else set()
-        symbols = list(set(grouped.keys()) | sweep_symbols)
+        smt_symbols = self.smt_divergence_service.active_symbols() if self.smt_divergence_service is not None else set()
+        symbols = list(set(grouped.keys()) | sweep_symbols | smt_symbols)
 
         if not symbols:
             logger.info("[FinnhubPrice] No active symbols to subscribe")
@@ -137,6 +142,11 @@ class FinnhubPriceService:
                         await self.daily_sweep_service.check_tick(symbol, price, previous_price)
                     except Exception as error:
                         logger.error(f"[FinnhubPrice] Daily Sweep tick check failed for {symbol}: {error}")
+                if self.smt_divergence_service is not None:
+                    try:
+                        await self.smt_divergence_service.check_tick(symbol, price, previous_price)
+                    except Exception as error:
+                        logger.error(f"[FinnhubPrice] SMT divergence tick check failed for {symbol}: {error}")
         elif parsed.get("type") == "error":
             logger.error(f"[FinnhubPrice] API error: {parsed.get('msg')}")
 
