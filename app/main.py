@@ -6,7 +6,6 @@ from telegram.ext import Application, MessageHandler, filters
 
 from app import config, scheduler
 from app.db import init_db
-from app.services.daily_sweep_service import DailySweepService
 from app.services.finnhub_price_service import FinnhubPriceService
 from app.services.invite_service import InviteService
 from app.services.market_data_service import MarketDataService
@@ -38,30 +37,16 @@ def build_services() -> tuple[TelegramBotService, FinnhubPriceService]:
         invite_service=invite_service,
     )
 
-    daily_sweep_service: DailySweepService | None = None
-    if config.TWELVE_DATA_API_KEY:
-        daily_sweep_service = DailySweepService(
-            api_key=config.TWELVE_DATA_API_KEY,
-            market_data=market_data,
-            users_service=users_service,
-            send_message=telegram_bot_service.send_message_to_user,
-        )
-    else:
-        logger.warning("TWELVE_DATA_API_KEY not set — Daily Sweep feature disabled")
-    telegram_bot_service.daily_sweep_service = daily_sweep_service
-
-    # SMT divergence (GBPUSD / EURUSD and EURJPY / GBPJPY): reuses the candles the Daily Sweep scan already
-    # fetches, so it needs the same Twelve Data key and is disabled (with a warning) without it
+    # SMT divergence (GBPUSD / EURUSD and EURJPY / GBPJPY): needs the server's Twelve Data key for the daily
+    # candles, and is disabled (with a warning) without it
     smt_divergence_service: SmtDivergenceHub | None = None
-    if config.TWELVE_DATA_API_KEY and daily_sweep_service is not None:
+    if config.TWELVE_DATA_API_KEY:
         smt_divergence_service = SmtDivergenceHub(
             api_key=config.TWELVE_DATA_API_KEY,
             market_data=market_data,
             users_service=users_service,
             send_message=telegram_bot_service.send_message_to_user,
         )
-        smt_divergence_service.wire(sweep_service=daily_sweep_service)
-        daily_sweep_service.candle_listeners.append(smt_divergence_service.on_candles)
     else:
         logger.warning("TWELVE_DATA_API_KEY not set — SMT divergence feature disabled")
     telegram_bot_service.smt_divergence_service = smt_divergence_service
@@ -69,12 +54,8 @@ def build_services() -> tuple[TelegramBotService, FinnhubPriceService]:
     finnhub_price_service = FinnhubPriceService(
         price_alert_service=price_alert_service,
         send_message=telegram_bot_service.send_message_to_user,
-        daily_sweep_service=daily_sweep_service,
         smt_divergence_service=smt_divergence_service,
     )
-    if daily_sweep_service is not None:
-        daily_sweep_service.subscribe_symbol = finnhub_price_service.subscribe_to_symbol
-        daily_sweep_service.get_last_price = finnhub_price_service.get_last_tick
     if smt_divergence_service is not None:
         smt_divergence_service.wire(
             subscribe_symbol=finnhub_price_service.subscribe_to_symbol,
@@ -100,8 +81,6 @@ async def _start_common(
     finnhub_price_service: FinnhubPriceService,
 ) -> None:
     await init_db()
-    if telegram_bot_service.daily_sweep_service is not None:
-        await telegram_bot_service.daily_sweep_service.bootstrap()
     if telegram_bot_service.smt_divergence_service is not None:
         await telegram_bot_service.smt_divergence_service.bootstrap()
     finnhub_price_service.start()
@@ -110,7 +89,6 @@ async def _start_common(
         price_alert_service=telegram_bot_service.price_alert_service,
         telegram_bot=telegram_bot_service,
         users_service=telegram_bot_service.users_service,
-        daily_sweep_service=telegram_bot_service.daily_sweep_service,
         smt_divergence_service=telegram_bot_service.smt_divergence_service,
     )
 

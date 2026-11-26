@@ -19,16 +19,12 @@ class FinnhubPriceService:
         self,
         price_alert_service: PriceAlertService,
         send_message: SendMessage,
-        daily_sweep_service: Any = None,
         smt_divergence_service: Any = None,
     ) -> None:
         self.price_alert_service = price_alert_service
         self.send_message = send_message
         self.finnhub_api_key = config.FINNHUB_API_KEY
 
-        # Optional Daily Sweep feature — ticks are forwarded to it when configured, and every pair
-        # with an ACTIVE setup is subscribed even if nobody has a normal price alert on it
-        self.daily_sweep_service = daily_sweep_service
         # Optional SMT divergence feature (GBPUSD / EURUSD and EURJPY / GBPJPY) — same idea:
         # it gets every tick, and its pairs are
         # subscribed while any of its levels is still being watched
@@ -94,9 +90,8 @@ class FinnhubPriceService:
 
     async def _subscribe_to_active_symbols(self) -> None:
         grouped = await self.price_alert_service.get_active_alerts_grouped_by_symbol()
-        sweep_symbols = self.daily_sweep_service.active_symbols() if self.daily_sweep_service is not None else set()
         smt_symbols = self.smt_divergence_service.active_symbols() if self.smt_divergence_service is not None else set()
-        symbols = list(set(grouped.keys()) | sweep_symbols | smt_symbols)
+        symbols = list(set(grouped.keys()) | smt_symbols)
 
         if not symbols:
             logger.info("[FinnhubPrice] No active symbols to subscribe")
@@ -138,11 +133,6 @@ class FinnhubPriceService:
                 self.last_price[symbol] = price
                 self.last_price_at[symbol] = datetime.datetime.now(datetime.timezone.utc)
                 await self._check_price_alerts(symbol, price, previous_price)
-                if self.daily_sweep_service is not None:
-                    try:
-                        await self.daily_sweep_service.check_tick(symbol, price, previous_price)
-                    except Exception as error:
-                        logger.error(f"[FinnhubPrice] Daily Sweep tick check failed for {symbol}: {error}")
                 if self.smt_divergence_service is not None:
                     try:
                         await self.smt_divergence_service.check_tick(symbol, price, previous_price)

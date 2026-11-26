@@ -26,17 +26,6 @@ async def init_db() -> None:
         # create_all never alters an existing table, so add columns introduced after a deployment's
         # first run. Additive only and idempotent — nothing is ever dropped at runtime.
         for statement in (
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_sweep_alerts_enabled BOOLEAN NOT NULL DEFAULT false",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_continuation_alerts_enabled "
-            "BOOLEAN NOT NULL DEFAULT false",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS divergence_alerts_enabled BOOLEAN NOT NULL DEFAULT false",
-            "ALTER TABLE daily_sweep_setups ADD COLUMN IF NOT EXISTS kind VARCHAR(16) NOT NULL DEFAULT 'SWEEP'",
-            "ALTER TABLE daily_sweep_setups ADD COLUMN IF NOT EXISTS level2 NUMERIC(18, 6)",
-            "ALTER TABLE daily_sweep_setups ADD COLUMN IF NOT EXISTS stage INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE daily_sweep_setups ADD COLUMN IF NOT EXISTS invalidated_at TIMESTAMPTZ",
-            "ALTER TABLE daily_sweep_setups ADD COLUMN IF NOT EXISTS invalidated_price NUMERIC(18, 6)",
-            # The INVALIDATED status doesn't fit the original VARCHAR(10). Widening is idempotent and
-            # needs no table rewrite.
-            "ALTER TABLE daily_sweep_setups ALTER COLUMN status TYPE VARCHAR(16)",
         ):
             await conn.execute(text(statement))

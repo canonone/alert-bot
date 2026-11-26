@@ -3,7 +3,7 @@ EURJPY / GBPJPY. The groups never mix: each has its own table, levels, state and
 
 The two pairs of a group are positively correlated, so they should take out their previous-day liquidity at about the same
 time. At each trading-day close (17:00 America/New_York) the previous-day high (PDH) and low (PDL) of both pairs are
-recorded from the synthetic daily candles Daily Sweep builds. For the next trading day each SIDE is watched on its
+recorded from synthetic daily candles built from 1H bars (see daily_candles). For the next trading day each SIDE is watched on its
 own:
 
   LOW  case: both pairs should trade to their PDL (price <= PDL)
@@ -33,7 +33,7 @@ from typing import Awaitable, Callable
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-import app.services.daily_sweep_service as sweep
+import app.services.daily_candles as daily
 from app.db import SessionLocal
 from app.models import SmtDivergenceLevel, SmtJpyDivergenceLevel
 from app.services.market_data_service import MarketDataService
@@ -64,7 +64,7 @@ EXPIRED = "EXPIRED"
 DIVERGENCE_WAIT_MINUTES = 60
 # "Trades to the level" is ANY touch or break. This is the tolerance (in pips; 0.0001 per pip for these pairs) that
 # widens the touch zone toward price: with a positive value, price within that many pips of the level counts as a
-# touch. Default 0 = a plain touch. Per-pair override like the margins in daily_sweep_service.
+# touch. Default 0 = a plain touch. Per-pair override.
 TOUCH_BUFFER_PIPS = 0.0
 PAIR_TOUCH_BUFFER_PIPS: dict[str, float] = {}
 # A laggard whose closest approach stayed within this many pips of its level is annotated (never suppressed): it may
@@ -129,7 +129,7 @@ def level_name(side: str) -> str:
 
 # ── Pure: levels, touches, deadlines ────────────────────────────────────────
 
-def extract_levels(day: sweep.DailyCandle) -> tuple[float, float]:
+def extract_levels(day: daily.DailyCandle) -> tuple[float, float]:
     """(PDH, PDL) of a completed synthetic daily candle."""
     return day.high, day.low
 
@@ -137,18 +137,18 @@ def extract_levels(day: sweep.DailyCandle) -> tuple[float, float]:
 def monitored_until(level_day: datetime.date) -> datetime.datetime:
     """The levels of `level_day` are watched until the NEXT trading day closes (Friday's levels run through
     Monday's close). DST-safe: built from New York wall-clock times."""
-    return sweep.trading_day_bounds(sweep.next_trading_day(level_day))[1]
+    return daily.trading_day_bounds(daily.next_trading_day(level_day))[1]
 
 
 def touched(side: str, level: float, price: float, pair: str) -> bool:
     """LOW: price <= PDL; HIGH: price >= PDH — any touch or break, widened by the (default 0) buffer."""
-    slack = (touch_buffer_pips_for(pair) + sweep._PIP_EPS) * sweep.pip_size(pair)
+    slack = (touch_buffer_pips_for(pair) + daily._PIP_EPS) * daily.pip_size(pair)
     return price <= level + slack if side == LOW else price >= level - slack
 
 
 def pips_from_level(side: str, level: float, price: float, pair: str) -> float:
     """How far `price` still is from touching `level`, in pips (positive = not there yet, <= 0 = touched)."""
-    pip = sweep.pip_size(pair)
+    pip = daily.pip_size(pair)
     return (price - level) / pip if side == LOW else (level - price) / pip
 
 
@@ -321,7 +321,7 @@ class RowState:
 # ── Pure: the alert text ────────────────────────────────────────────────────
 
 def _hour_range(start: datetime.datetime) -> str:
-    wat = sweep._to_wat(start)
+    wat = daily._to_wat(start)
     return f"{wat:%Y-%m-%d %H:%M}–{wat + HOUR:%H:%M} WAT"
 
 
@@ -346,15 +346,15 @@ def format_divergence(
     laggard = other_pair(leader)
     name = level_name(side)
     position = "above" if side == LOW else "below"
-    fmt_leader, fmt_laggard = (lambda v: sweep.format_price(leader, v)), (lambda v: sweep.format_price(laggard, v))
+    fmt_leader, fmt_laggard = (lambda v: daily.format_price(leader, v)), (lambda v: daily.format_price(laggard, v))
     lead_level, lag_level = levels[leader], levels[laggard]
 
     if basis == BASIS_TICK:
-        when = f"touched {sweep._wat_str(leader_touched_at)} at {fmt_leader(leader_price)}"
+        when = f"touched {daily._wat_str(leader_touched_at)} at {fmt_leader(leader_price)}"
     elif basis == BASIS_HOUR:
         when = f"touched in the {_hour_range(leader_touched_at)} hour (extreme {fmt_leader(leader_price)})"
     else:
-        when = f"already beyond it when detected, {sweep._wat_str(leader_touched_at)} (price {fmt_leader(leader_price)})"
+        when = f"already beyond it when detected, {daily._wat_str(leader_touched_at)} (price {fmt_leader(leader_price)})"
     window = minutes_between(leader_touched_at, deadline_at) if basis == BASIS_TICK else DIVERGENCE_WAIT_MINUTES
 
     lines = [
@@ -389,7 +389,7 @@ def format_divergence(
                 )
         interpretation = f"{leader} took its {name}; {laggard} held {position} its {name} after {window} min."
 
-    lines.append(f"⏱ Window: {window} min, closed {sweep._wat_str(deadline_at)}")
+    lines.append(f"⏱ Window: {window} min, closed {daily._wat_str(deadline_at)}")
     lines += ["━━━━━━━━━━━━━━━━━━━━", f"ℹ️ {interpretation}"]
     if note:
         lines.append(note)
@@ -420,14 +420,14 @@ def format_status_message(rows: list, now: datetime.datetime, group: PairGroup =
     first = rows[0]
     lines = [
         title,
-        f"Levels from {first.trading_day:%a %Y-%m-%d} · monitored until {sweep._wat_str(first.expires_at)}",
+        f"Levels from {first.trading_day:%a %Y-%m-%d} · monitored until {daily._wat_str(first.expires_at)}",
         "━━━━━━━━━━━━━━━━━━━━",
     ]
     for row in sorted(rows, key=lambda r: (r.side != HIGH,)):  # PDH first, then PDL
         name = level_name(row.side)
         lines.append(
             f"<b>{name}</b>  "
-            + " · ".join(f"{pair} {sweep.format_price(pair, getattr(row, level_column(pair)))}" for pair in group.pairs)
+            + " · ".join(f"{pair} {daily.format_price(pair, getattr(row, level_column(pair)))}" for pair in group.pairs)
         )
         lines.append("   " + _status_line(row, now))
     lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -443,8 +443,8 @@ def _status_line(row, now: datetime.datetime) -> str:
         if row.leader_touch_basis == BASIS_HOUR:
             when = f"in the {_hour_range(row.leader_touched_at)} hour"
         else:
-            when = sweep._wat_str(row.leader_touched_at)
-        line = f"🟡 {row.leader_pair} touched its {name} {when} — {laggard} must touch by {sweep._wat_str(row.deadline_at)}"
+            when = daily._wat_str(row.leader_touched_at)
+        line = f"🟡 {row.leader_pair} touched its {name} {when} — {laggard} must touch by {daily._wat_str(row.deadline_at)}"
         if row.laggard_best_price is not None:
             level = getattr(row, level_column(laggard))
             line += f" (closest so far: {pips_from_level(row.side, level, row.laggard_best_price, laggard):.1f} pips away)"
@@ -459,7 +459,7 @@ def _status_line(row, now: datetime.datetime) -> str:
 # ── The service (one pair group) ────────────────────────────────────────────
 
 class RequestPacer:
-    """Keeps the SMT services' own Twelve Data fetches spaced like the sweep scan's. Shared by all groups, so one
+    """Keeps the SMT services' own Twelve Data fetches spaced for the free tier. Shared by all groups, so one
     group's first request doesn't follow straight after another group's last."""
 
     def __init__(self) -> None:
@@ -468,7 +468,7 @@ class RequestPacer:
 
     async def run(self, request: Callable[[], Awaitable]):
         async with self._lock:
-            wait = self._last + sweep.SCAN_REQUEST_SPACING_SECONDS - time.monotonic()
+            wait = self._last + daily.SCAN_REQUEST_SPACING_SECONDS - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
             try:
@@ -495,9 +495,7 @@ class SmtDivergenceService:
         self.users_service = users_service
         self.send_message = send_message
 
-        # Wired up in main.py: the sweep service (its scan feeds this one and shares the Twelve Data rate limit), the
-        # Finnhub subscribe call, and the latest tick per symbol.
-        self.sweep_service: sweep.DailySweepService | None = None
+        # Wired up in main.py: the Finnhub subscribe call, and the latest tick per symbol.
         self.subscribe_symbol: SubscribeSymbol | None = None
         self.get_last_price: Callable[[str], tuple[float, datetime.datetime] | None] = lambda symbol: None
         # Injectable so tests can pin "now"
@@ -507,10 +505,7 @@ class SmtDivergenceService:
         self._rows: dict[int, RowState] = {}
         self._inflight: set[int] = set()  # rows with a claim being awaited: a concurrent tick/timer skips them
         self._ticks: dict[str, tuple[float, datetime.datetime]] = {}  # the latest tick of each pair, seen here
-        self._candles: dict[str, tuple[datetime.date, list[dict]]] = {}  # from the sweep scan's listener
-        self._captured_day: datetime.date | None = None
         self._capture_lock = asyncio.Lock()
-        self._tasks: set[asyncio.Task] = set()
 
     # ── Database (every access lives here; tests swap these for an in-memory table) ──
 
@@ -518,7 +513,7 @@ class SmtDivergenceService:
         self, trading_day: datetime.date, side: str, levels: dict[str, float], expires_at: datetime.datetime, state: SideState
     ) -> int | None:
         """Inserts a side already in the state the replay found. None = it exists already (the unique constraint is
-        the once-only claim, so a rescan creates and announces nothing twice)."""
+        the once-only claim, so capturing again creates and announces nothing twice)."""
         values = dict(
             trading_day=trading_day, side=side, **{level_column(pair): levels[pair] for pair in self.pairs},
             status=state.status, leader_pair=state.leader_pair, leader_touched_at=state.leader_touched_at,
@@ -640,7 +635,7 @@ class SmtDivergenceService:
         if tick is None:
             return None
         price, at = tick
-        return price if now - at <= sweep.FRESH_PRICE_MAX_AGE else None
+        return price if now - at <= daily.FRESH_PRICE_MAX_AGE else None
 
     def _latest_price(self, pair: str) -> float | None:
         """The latest Finnhub tick, falling back to the last known price (however old)."""
@@ -649,42 +644,20 @@ class SmtDivergenceService:
 
     # ── Level capture ────────────────────────────────────────────────────────
 
-    def on_candles(
-        self, pair: str, candles_1h: list[dict], expected_day: datetime.date, now: datetime.datetime
-    ) -> None:
-        """DailySweepService.candle_listeners hook. Cheap and synchronous (it runs inside the sweep scan): it only
-        buffers the candles and, once both pairs are in, spawns the capture as its own task."""
-        if pair not in self.pairs:
-            return
-        self._candles[pair] = (expected_day, candles_1h)
-        if self._captured_day == expected_day:
-            return
-        if all(self._candles.get(p, (None, []))[0] == expected_day for p in self.pairs):
-            task = asyncio.create_task(self._capture_from_buffer(expected_day))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
-
-    async def _capture_from_buffer(self, expected_day: datetime.date) -> None:
-        try:
-            if await self.capture({p: self._candles[p][1] for p in self.pairs}, expected_day):
-                self._captured_day = expected_day
-        except Exception as error:
-            logger.error(f"{self.group.log_prefix} Level capture failed: {error}")
-
     async def capture(self, candles_by_pair: dict[str, list[dict]], expected_day: datetime.date) -> bool:
         """Records both pairs' PDH/PDL from `expected_day`'s synthetic daily candle (only if BOTH pairs' latest
         complete day is that day) and arms each side at the state the bars since the close show. True = done (or
-        nothing left to do); False = not possible yet (a pair is missing/lagging): the sweep's retry will call again."""
+        nothing left to do); False = not possible yet (a pair is missing/lagging): the retry will call again."""
         async with self._capture_lock:
             now = self.clock()
-            days: dict[str, sweep.DailyCandle] = {}
+            days: dict[str, daily.DailyCandle] = {}
             for pair in self.pairs:
                 candles = candles_by_pair.get(pair)
                 if not candles:
                     logger.warning(f"{self.group.log_prefix} No candles for {pair} yet — levels not recorded")
                     return False
-                usable = sweep.usable_daily_candles(
-                    sweep.aggregate_1h_to_daily(candles, now, sweep.min_daily_bars_for(pair)), pair
+                usable = daily.usable_daily_candles(
+                    daily.aggregate_1h_to_daily(candles, now, daily.min_daily_bars_for(pair)), pair
                 )
                 if not usable or usable[-1].date != expected_day:
                     latest = usable[-1].date if usable else None
@@ -701,7 +674,7 @@ class SmtDivergenceService:
                 return True
             day_close = days[self.pairs[0]].end_utc
             bars = {
-                pair: [b for b in sweep.bars_since(candles_by_pair[pair], day_close) if b["datetime"] < expires_at]
+                pair: [b for b in daily.bars_since(candles_by_pair[pair], day_close) if b["datetime"] < expires_at]
                 for pair in self.pairs
             }
             basis = BASIS_HOUR
@@ -754,48 +727,54 @@ class SmtDivergenceService:
                         logger.error(f"{self.group.log_prefix} Could not subscribe {pair} to the live feed: {error}")
             return True
 
-    async def capture_now(self) -> str:
-        """Own fetch of just this group's two pairs (the sweep scan normally feeds the levels): for /divscan and the startup
-        catch-up. Shares the Twelve Data spacing and never runs while a sweep scan is in progress."""
-        if self.sweep_service is not None and self.sweep_service.scan_running:
-            return f"A Daily Sweep scan is running — it feeds the levels itself when it reaches {' and '.join(self.pairs)}."
+    async def capture_latest(self) -> tuple[bool, str]:
+        """Fetches this group's two pairs and records the latest closed trading day's levels. Returns (done, what
+        happened); not done means it is worth trying again later."""
         now = self.clock()
-        expected_day = sweep.latest_closed_trading_day(now)
+        expected_day = daily.latest_closed_trading_day(now)
         candles: dict[str, list[dict]] = {}
         for pair in self.pairs:
             data, quota_exceeded = await self.pacer.run(
                 lambda: self.market_data.get_candles(
-                    pair, sweep.ONE_H_INTERVAL, self.api_key, outputsize=sweep.ONE_H_LOOKBACK
+                    pair, daily.ONE_H_INTERVAL, self.api_key, outputsize=daily.ONE_H_LOOKBACK
                 )
             )
             if quota_exceeded:
-                return "Twelve Data quota exceeded — try again in a minute."
+                return False, "Twelve Data quota exceeded — try again in a minute."
             if not data:
-                return f"No candle data returned for {pair}."
+                return False, f"No candle data returned for {pair}."
             candles[pair] = data
-        done = await self.capture(candles, expected_day)
-        if done:
-            self._captured_day = expected_day
-        return "Levels recorded." if done else "The latest complete trading day isn't available for both pairs yet."
+        if await self.capture(candles, expected_day):
+            return True, "Levels recorded."
+        return False, "The latest complete trading day isn't available for both pairs yet."
+
+    async def capture_now(self) -> str:
+        """/divscan: fetch and record, whether or not the levels already exist (rows are never duplicated)."""
+        return (await self.capture_latest())[1]
+
+    async def record_levels(self) -> tuple[bool, str | None]:
+        """The 17:10 New York job and its retry: fetches only if this group has no levels for the latest closed
+        trading day. (done, what happened — None when there was nothing to do)."""
+        if await self._count_rows(daily.latest_closed_trading_day(self.clock())):
+            return True, None
+        return await self.capture_latest()
 
     async def needs_catch_up(self) -> bool:
         """The latest closed trading day's levels are missing although its 17:10 scan time has passed and its
         monitored period isn't over (the bot was down, or the feature was just deployed)."""
         now = self.clock()
-        expected_day = sweep.latest_closed_trading_day(now)
+        expected_day = daily.latest_closed_trading_day(now)
         scheduled = datetime.datetime.combine(
-            expected_day, datetime.time(sweep.SCAN_HOUR_NY, sweep.SCAN_MINUTE_NY), tzinfo=sweep.NY
+            expected_day, datetime.time(daily.SCAN_HOUR_NY, daily.SCAN_MINUTE_NY), tzinfo=daily.NY
         ).astimezone(UTC)
         if now < scheduled or now >= monitored_until(expected_day):
             return False
         return await self._count_rows(expected_day) == 0
 
     async def catch_up(self) -> str | None:
-        """Startup: capture the missing levels ourselves, unless the sweep's own catch-up scan is about to feed them."""
+        """Startup: record the levels if the 17:10 run was missed."""
         if not await self.needs_catch_up():
             return None
-        if self.sweep_service is not None and await self.sweep_service.needs_catch_up():
-            return "the Daily Sweep catch-up scan will feed the levels"
         logger.info(f"{self.group.log_prefix} Levels for the latest closed trading day are missing — capturing them")
         return await self.capture_now()
 
@@ -836,7 +815,7 @@ class SmtDivergenceService:
             return
         now = self.clock()
         self._ticks[symbol] = (price, now)
-        if sweep.is_market_closed(now):
+        if daily.is_market_closed(now):
             return  # weekend quotes are not trading
         for row in list(self._rows.values()):
             if row.id in self._inflight or now >= row.expires_at:
@@ -970,13 +949,10 @@ class SmtDivergenceHub:
 
     def wire(
         self,
-        sweep_service: sweep.DailySweepService | None = None,
         subscribe_symbol: SubscribeSymbol | None = None,
         get_last_price: Callable[[str], tuple[float, datetime.datetime] | None] | None = None,
     ) -> None:
         for service in self.services:
-            if sweep_service is not None:
-                service.sweep_service = sweep_service
             if subscribe_symbol is not None:
                 service.subscribe_symbol = subscribe_symbol
             if get_last_price is not None:
@@ -1000,18 +976,22 @@ class SmtDivergenceHub:
     def active_symbols(self) -> set[str]:
         return set().union(*(service.active_symbols() for service in self.services))
 
-    def on_candles(
-        self, pair: str, candles_1h: list[dict], expected_day: datetime.date, now: datetime.datetime
-    ) -> None:
-        for service in self.services:
-            if pair in service.pairs:
-                service.on_candles(pair, candles_1h, expected_day, now)
-
     async def check_tick(self, symbol: str, price: float, previous_price: float | None) -> None:
         await self._each("Tick check", lambda s: s.check_tick(symbol, price, previous_price))
 
     async def check_deadlines(self) -> None:
         await self._each("Deadline check", lambda s: s.check_deadlines())
+
+    async def record_levels(self) -> bool:
+        """Records the latest closed trading day's levels of every group that lacks them. True = nothing is left to
+        retry."""
+        all_done = True
+        for service, outcome, error in await self._each("Level capture", lambda s: s.record_levels()):
+            done, message = outcome or (False, None)
+            all_done = all_done and done
+            if message and not error:
+                logger.log(logging.INFO if done else logging.WARNING, f"{service.group.log_prefix} {message}")
+        return all_done
 
     async def catch_up(self) -> str | None:
         done = [

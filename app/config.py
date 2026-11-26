@@ -29,7 +29,7 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
 FINNHUB_API_KEY = _get_or_throw("FINNHUB_API_KEY")
 
-# Server-level Twelve Data key for the Daily Sweep feature (1H candle fetches are system-wide,
+# Server-level Twelve Data key for SMT divergence (1H candle fetches are system-wide,
 # not per-user). Optional — if unset, the feature is disabled at startup rather than crashing
 # the whole bot.
 TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")

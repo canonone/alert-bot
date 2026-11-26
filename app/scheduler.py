@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 
 from telegram.ext import Application, ContextTypes
 
-from app.services.daily_sweep_service import SCAN_RETRY_DELAY_SECONDS, DailySweepService
+from app.services.daily_candles import SCAN_HOUR_NY, SCAN_MINUTE_NY, SCAN_RETRY_DELAY_SECONDS
 from app.services.smt_divergence_service import DEADLINE_CHECK_INTERVAL_SECONDS, SmtDivergenceHub
 from app.services.price_alert_service import PriceAlertService
 from app.services.users_service import UsersService
@@ -18,7 +18,6 @@ def register_jobs(
     price_alert_service: PriceAlertService,
     telegram_bot: TelegramBotService,
     users_service: UsersService,
-    daily_sweep_service: DailySweepService | None = None,
     smt_divergence_service: SmtDivergenceHub | None = None,
 ) -> None:
     async def run_daily_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -63,52 +62,6 @@ def register_jobs(
         reset_alert_id_counters, time=datetime.time(hour=23, tzinfo=datetime.timezone.utc), days=FRIDAY
     )
 
-    if daily_sweep_service is not None:
-        async def retry_daily_sweep_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
-            pairs: list[str] = context.job.data
-            try:
-                report = await daily_sweep_service.run_scan(pairs)
-            except Exception as error:
-                logger.error(f"[DailySweep] Retry scan failed: {error}")
-                return
-            if report.retry_pairs:
-                logger.warning(f"[DailySweep] Still no usable data after retry for: {', '.join(report.retry_pairs)}")
-
-        async def run_daily_sweep_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
-            try:
-                report = await daily_sweep_service.run_scan()
-            except Exception as error:
-                logger.error(f"[DailySweep] Scan failed: {error}")
-                return
-            if report.retry_pairs:
-                logger.info(f"[DailySweep] Retrying {len(report.retry_pairs)} pair(s) in 15 minutes")
-                context.job_queue.run_once(
-                    retry_daily_sweep_scan, when=SCAN_RETRY_DELAY_SECONDS, data=report.retry_pairs
-                )
-
-        async def catch_up_daily_sweep_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
-            try:
-                if not await daily_sweep_service.needs_catch_up():
-                    return
-            except Exception as error:
-                logger.error(f"[DailySweep] Catch-up check failed: {error}")
-                return
-            logger.info("[DailySweep] Latest closed trading day was never scanned — running catch-up scan")
-            await run_daily_sweep_scan(context)
-
-        # Startup catch-up (bot was down at 17:10): a one-off job so it runs in the background
-        application.job_queue.run_once(catch_up_daily_sweep_scan, when=15)
-
-        # 17:10 New York time — ten minutes after each forex trading day closes at 17:00 NY, so the
-        # final 1H bar has had time to be published. The tzinfo makes APScheduler follow US
-        # daylight saving. Monday-Friday only: days use PTB's 0=Sunday convention (see above).
-        application.job_queue.run_daily(
-            run_daily_sweep_scan,
-            time=datetime.time(hour=17, minute=10, tzinfo=ZoneInfo("America/New_York")),
-            days=(1, 2, 3, 4, 5),
-        )
-        logger.info("[Scheduler] Daily Sweep scan registered (17:10 America/New_York, Mon-Fri)")
-
     if smt_divergence_service is not None:
         async def check_smt_deadlines(context: ContextTypes.DEFAULT_TYPE) -> None:
             # Windows must close even when no tick arrives, so this runs on its own clock, not on price ticks
@@ -126,9 +79,34 @@ def register_jobs(
             if result:
                 logger.info(f"[SmtDivergence] Catch-up: {result}")
 
+        async def record_levels(context: ContextTypes.DEFAULT_TYPE) -> bool:
+            try:
+                return await smt_divergence_service.record_levels()
+            except Exception as error:
+                logger.error(f"[SmtDivergence] Level capture failed: {error}")
+                return False
+
+        async def retry_smt_levels(context: ContextTypes.DEFAULT_TYPE) -> None:
+            if not await record_levels(context):
+                logger.warning("[SmtDivergence] Still could not record every group's levels after the retry")
+
+        async def record_smt_levels(context: ContextTypes.DEFAULT_TYPE) -> None:
+            if not await record_levels(context):
+                logger.info("[SmtDivergence] Retrying the level capture in 15 minutes")
+                context.job_queue.run_once(retry_smt_levels, when=SCAN_RETRY_DELAY_SECONDS)
+
+        # 17:10 New York time — ten minutes after each forex trading day closes at 17:00 NY, so the final 1H bar has
+        # had time to be published. The tzinfo makes APScheduler follow US daylight saving. Monday-Friday only:
+        # days use PTB's 0=Sunday convention (see above).
+        application.job_queue.run_daily(
+            record_smt_levels,
+            time=datetime.time(hour=SCAN_HOUR_NY, minute=SCAN_MINUTE_NY, tzinfo=ZoneInfo("America/New_York")),
+            days=(1, 2, 3, 4, 5),
+        )
+        logger.info("[Scheduler] SMT divergence level capture registered (17:10 America/New_York, Mon-Fri)")
         application.job_queue.run_repeating(
             check_smt_deadlines, interval=DEADLINE_CHECK_INTERVAL_SECONDS, first=30
         )
-        # After the Daily Sweep catch-up has had its chance to start (it feeds these levels when it runs)
-        application.job_queue.run_once(catch_up_smt_levels, when=45)
+        # Startup catch-up (bot was down at 17:10): a one-off job so it runs in the background
+        application.job_queue.run_once(catch_up_smt_levels, when=15)
         logger.info(f"[Scheduler] SMT divergence deadline check registered (every {DEADLINE_CHECK_INTERVAL_SECONDS}s)")
