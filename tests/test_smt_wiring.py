@@ -5,7 +5,6 @@ import json
 import logging
 from types import SimpleNamespace
 
-import pytest
 from telegram.ext import Application
 
 import app.main as main
@@ -43,11 +42,11 @@ def trade(symbol, price):
     return json.dumps({"type": "trade", "data": [{"s": symbol, "p": price}]})
 
 
-def make_finnhub(sweep=None, smt=None):
+def make_finnhub(smt=None):
     async def send(chat_id, message):
         pass
 
-    return FinnhubPriceService(PriceAlerts(), send, daily_sweep_service=sweep, smt_divergence_service=smt)
+    return FinnhubPriceService(PriceAlerts(), send, smt_divergence_service=smt)
 
 
 def test_every_tick_is_forwarded_to_the_smt_service():
@@ -58,18 +57,14 @@ def test_every_tick_is_forwarded_to_the_smt_service():
     assert smt.ticks == [("GBPUSD", 1.2649, None), ("GBPUSD", 1.2641, 1.2649)]
 
 
-def test_an_smt_failure_never_stops_the_other_features_or_the_feed(caplog):
-    sweep, smt = Recorder(), Recorder(fail=True)
-    svc = make_finnhub(sweep=sweep, smt=smt)
+def test_an_smt_failure_never_stops_the_feed_or_the_price_alerts(caplog):
+    smt = Recorder(fail=True)
+    svc = make_finnhub(smt=smt)
     with caplog.at_level(logging.ERROR):
         asyncio.run(svc._handle_message(trade("OANDA:EUR_USD", 1.0719)))
         asyncio.run(svc._handle_message(trade("OANDA:EUR_USD", 1.0718)))  # and the feed keeps going
-    assert len(sweep.ticks) == 2 and len(smt.ticks) == 2
+    assert len(smt.ticks) == 2 and svc.last_price["EURUSD"] == 1.0718
     assert "SMT divergence tick check failed for EURUSD" in caplog.text
-    # and the other way round: a failing sweep check doesn't starve SMT
-    sweep2, smt2 = Recorder(fail=True), Recorder()
-    asyncio.run(make_finnhub(sweep=sweep2, smt=smt2)._handle_message(trade("OANDA:EUR_USD", 1.07)))
-    assert len(smt2.ticks) == 1
 
 
 def test_works_without_the_smt_service():
@@ -110,8 +105,15 @@ def test_pairs_with_open_levels_are_subscribed_even_with_no_price_alerts(monkeyp
 # ── Scheduler ───────────────────────────────────────────────────────────────
 
 class Smt:
-    def __init__(self, catch_up_result="ok", fail=False):
+    def __init__(self, catch_up_result="ok", fail=False, recorded=()):
         self.calls, self.result, self.fail = [], catch_up_result, fail
+        self.recorded = list(recorded)  # what successive record_levels() calls return
+
+    async def record_levels(self):
+        self.calls.append("record")
+        if self.fail:
+            raise RuntimeError("boom")
+        return self.recorded.pop(0) if self.recorded else True
 
     async def check_deadlines(self):
         self.calls.append("deadlines")
@@ -167,6 +169,55 @@ def test_job_failures_are_logged_not_raised(caplog):
     assert "Deadline check failed" in caplog.text and "Catch-up failed" in caplog.text
 
 
+class JobQueue:
+    def __init__(self):
+        self.once = []
+
+    def run_once(self, callback, when):
+        self.once.append((callback, when))
+
+
+def run_capture_job(smt):
+    """Runs the 17:10 job and then whatever retry it queued."""
+    queue = JobQueue()
+
+    async def body():
+        application = jobs_for(smt)
+        application.job_queue.scheduler.start()
+        try:
+            job = {job.name: job for job in application.job_queue.jobs()}["record_smt_levels"]
+            trigger = str(job.job.trigger)
+            await job.callback(SimpleNamespace(job_queue=queue))
+            for callback, _ in queue.once:
+                await callback(SimpleNamespace(job_queue=queue))
+            return trigger, job.job.trigger.timezone
+        finally:
+            application.job_queue.scheduler.shutdown(wait=False)
+
+    trigger, timezone = asyncio.run(body())
+    return trigger, str(timezone), queue.once
+
+
+def test_the_levels_are_captured_at_17_10_new_york_on_weekdays():
+    smt = Smt()
+    trigger, timezone, queued = run_capture_job(smt)
+    assert "hour='17'" in trigger and "minute='10'" in trigger and "day_of_week='mon,tue,wed,thu,fri'" in trigger
+    assert timezone == "America/New_York" and smt.calls == ["record"] and queued == []
+
+
+def test_a_failed_capture_is_retried_once_after_15_minutes(caplog):
+    smt = Smt(recorded=[False, True])
+    _, _, queued = run_capture_job(smt)
+    assert smt.calls == ["record", "record"] and [when for _, when in queued] == [15 * 60]
+    smt = Smt(recorded=[False, False])
+    with caplog.at_level(logging.WARNING):
+        _, _, queued = run_capture_job(smt)
+    assert len(queued) == 1 and "Still could not record" in caplog.text  # no endless retrying
+    smt = Smt(fail=True)  # an exception counts as a failure too
+    _, _, queued = run_capture_job(smt)
+    assert smt.calls == ["record", "record"] and len(queued) == 1
+
+
 def test_no_smt_jobs_without_the_service():
     async def body():
         application = jobs_for(None)
@@ -177,20 +228,19 @@ def test_no_smt_jobs_without_the_service():
             application.job_queue.scheduler.shutdown(wait=False)
 
     names = asyncio.run(body())
-    assert "check_smt_deadlines" not in names and "catch_up_smt_levels" not in names
+    assert names == {"run_daily_cleanup", "reset_alert_id_counters"}
 
 
 # ── build_services ──────────────────────────────────────────────────────────
 
-def test_build_services_wires_the_smt_service_to_the_sweep_scan_and_the_feed(monkeypatch):
+def test_build_services_wires_the_smt_service_to_the_feed(monkeypatch):
     monkeypatch.setattr(main.config, "TWELVE_DATA_API_KEY", "k")
     telegram, finnhub = main.build_services()
-    smt, sweep = telegram.smt_divergence_service, telegram.daily_sweep_service
+    smt = telegram.smt_divergence_service
     assert smt is not None and finnhub.smt_divergence_service is smt
-    assert sweep.candle_listeners == [smt.on_candles]
     assert [s.pairs for s in smt.services] == [(PAIR_GBP, PAIR_EUR), ("EURJPY", "GBPJPY")]
     for service in smt.services:  # every group is wired the same way
-        assert service.sweep_service is sweep and service.api_key == "k"
+        assert service.api_key == "k"
         assert service.subscribe_symbol == finnhub.subscribe_to_symbol and service.get_last_price == finnhub.get_last_tick
     assert smt.services[0].pacer is smt.services[1].pacer  # one Twelve Data spacing between them
 
@@ -268,7 +318,7 @@ def test_divalerts_usage_and_approval_gating():
     assert users.flags == [] and all("Usage: <code>/divalerts on</code>" in m for _, m in sent)
     service, users, sent = bot(approved=False)
     command(service, "42", "/divalerts on")
-    assert users.flags == [] and "Access Required" in sent[0][1]  # approved users only, like /sweepalerts
+    assert users.flags == [] and "Access Required" in sent[0][1]  # approved users only
 
 
 def test_divergence_and_smt_show_the_status():
@@ -304,6 +354,16 @@ def test_divscan_reports_a_failure(caplog):
     service.smt_divergence_service.capture_now = broken
     command(service, "admin", "/divscan")
     assert "Level capture failed: no data" in sent[-1][1]
+
+
+def test_the_removed_sweep_and_continuation_commands_do_nothing():
+    service, users, sent = bot()
+    for text in ("/sweepalerts on", "/contalerts on", "/sweeps", "/setups", "/sweepcheck XAUUSD"):
+        command(service, "42", text)
+    command(service, "admin", "/sweepscan")
+    assert sent == [] and users.flags == []
+    command(service, "admin", "/help")
+    assert not any(word in sent[0][1].lower() for word in ("sweep", "continuation", "contalerts"))
 
 
 def test_help_lists_the_new_commands():

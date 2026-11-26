@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import app.services.daily_sweep_service as sw
+import app.services.daily_candles as sw
 import app.services.smt_divergence_service as smt
 from app.services.smt_divergence_service import (
     ACTIVE,
@@ -22,7 +22,7 @@ from app.services.smt_divergence_service import (
     SmtDivergenceService,
 )
 
-from test_daily_sweep import HOUR, D, day_hours, ny, utc
+from test_daily_candles import HOUR, D, day_hours, utc
 from test_smt_divergence import CLOSE, LEVEL_DAY, LEVELS, PIP, UNTIL, bar, hour
 
 MIN = datetime.timedelta(minutes=1)
@@ -584,43 +584,36 @@ def test_only_divergence_subscribers_are_messaged():
     assert sent2 == [] and table2.status(LOW) == DIVERGENCE  # still resolved; just nobody to tell
 
 
-# ── The sweep scan's listener ───────────────────────────────────────────────
+# ── The daily capture (17:10 New York) ──────────────────────────────────────
 
-def test_listener_captures_once_both_pairs_have_arrived():
-    async def body():
-        svc, table, sent, _ = make()
-        candles = day_candles()
-        svc.on_candles(PAIR_GBP, candles[PAIR_GBP], LEVEL_DAY, NOW)
-        await asyncio.sleep(0.01)
-        assert table.rows == {}  # EURUSD hasn't been fetched yet
-        svc.on_candles("USDJPY", [], LEVEL_DAY, NOW)  # another pair: ignored
-        svc.on_candles(PAIR_EUR, candles[PAIR_EUR], LEVEL_DAY, NOW)
-        await asyncio.gather(*svc._tasks)
-        assert len(table.rows) == 2 and svc._captured_day == LEVEL_DAY
-        svc.on_candles(PAIR_GBP, candles[PAIR_GBP], LEVEL_DAY, NOW)  # a retry scan re-delivers a pair
-        await asyncio.sleep(0.01)
-        assert len(table.rows) == 2 and not svc._tasks
+class MarketData:
+    def __init__(self, candles=None, quota=False):
+        self.candles, self.quota, self.requests = candles or day_candles(), quota, []
 
-    run(body())
+    async def get_candles(self, pair, interval, api_key, outputsize=2):
+        self.requests.append((pair, interval, outputsize))
+        return ([], True) if self.quota else (self.candles[pair], False)
 
 
-def test_listener_does_not_mix_days_and_retries_after_a_failed_capture():
-    async def body():
-        svc, table, _, _ = make()
-        candles = day_candles()
-        svc.on_candles(PAIR_GBP, candles[PAIR_GBP], LEVEL_DAY, NOW)
-        svc.on_candles(PAIR_EUR, candles[PAIR_EUR], D(2026, 10, 26), NOW)  # a different expected day
-        await asyncio.sleep(0.01)
-        assert table.rows == {} and svc._captured_day is None
-        # EURUSD arrives for the right day but lagging (the previous day's candles): capture says "not yet"
-        svc.on_candles(PAIR_EUR, day_candles(D(2026, 10, 26))[PAIR_EUR], LEVEL_DAY, NOW)
-        await asyncio.gather(*svc._tasks)
-        assert table.rows == {} and svc._captured_day is None
-        svc.on_candles(PAIR_EUR, candles[PAIR_EUR], LEVEL_DAY, NOW)  # the 15-minute retry brings it
-        await asyncio.gather(*svc._tasks)
-        assert len(table.rows) == 2
+def test_record_levels_fetches_once_and_not_again_once_recorded(monkeypatch):
+    monkeypatch.setattr(sw, "SCAN_REQUEST_SPACING_SECONDS", 0)
+    svc, table, _, _ = make()
+    svc.market_data = MarketData()
+    assert run(svc.record_levels()) == (True, "Levels recorded.")
+    assert [r[0] for r in svc.market_data.requests] == [PAIR_GBP, PAIR_EUR] and len(table.rows) == 2
+    assert run(svc.record_levels()) == (True, None)  # nothing to do: no further requests
+    assert len(svc.market_data.requests) == 2
 
-    run(body())
+
+def test_record_levels_reports_not_done_while_a_pair_is_lagging_then_succeeds(monkeypatch):
+    monkeypatch.setattr(sw, "SCAN_REQUEST_SPACING_SECONDS", 0)
+    svc, table, _, _ = make()
+    lagging = {**day_candles(), PAIR_EUR: day_candles(D(2026, 10, 26))[PAIR_EUR]}
+    svc.market_data = MarketData(lagging)
+    done, message = run(svc.record_levels())
+    assert done is False and "isn't available" in message and table.rows == {}
+    svc.market_data = MarketData()  # the 15-minute retry
+    assert run(svc.record_levels())[0] is True and len(table.rows) == 2
 
 
 # ── Catch-up and the own fetch ──────────────────────────────────────────────
@@ -638,31 +631,21 @@ def test_needs_catch_up_only_when_levels_are_missing_inside_the_period():
     assert run(other.needs_catch_up()) is True  # missing, and the period is still running
 
 
-def test_catch_up_defers_to_the_sweep_catch_up_scan():
+def test_catch_up_fetches_only_when_the_levels_are_missing():
     svc, table, _, _ = make(now=CLOSE + 30 * MIN)
     calls = []
-
-    class Sweep:
-        scan_running = False
-
-        async def needs_catch_up(self):
-            return True
-
-    svc.sweep_service = Sweep()
 
     async def fake_capture_now():
         calls.append("own")
         return "ok"
 
     svc.capture_now = fake_capture_now
-    assert "will feed the levels" in run(svc.catch_up()) and calls == []
-    Sweep.needs_catch_up = lambda self: asyncio.sleep(0, result=False)
     assert run(svc.catch_up()) == "ok" and calls == ["own"]
     table.rows[1] = dict(trading_day=LEVEL_DAY)  # levels exist: nothing to do
-    assert run(svc.catch_up()) is None
+    assert run(svc.catch_up()) is None and calls == ["own"]
 
 
-def test_own_fetch_gets_just_the_two_pairs_with_spacing_and_never_during_a_sweep_scan(monkeypatch):
+def test_own_fetch_gets_just_the_two_pairs_with_spacing(monkeypatch):
     sleeps = []
 
     async def fake_sleep(seconds):
@@ -671,19 +654,9 @@ def test_own_fetch_gets_just_the_two_pairs_with_spacing_and_never_during_a_sweep
     monkeypatch.setattr(smt.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(sw, "SCAN_REQUEST_SPACING_SECONDS", 8.0)
     svc, table, sent, _ = make(now=CLOSE + 30 * MIN)
-    fetched = []
-    candles = day_candles()
-
-    class MD:
-        async def get_candles(self, pair, interval, key, outputsize=2):
-            fetched.append((pair, interval, outputsize))
-            return candles[pair], False
-
-    svc.market_data = MD()
-    svc.sweep_service = SimpleNamespace(scan_running=True)
-    assert "scan is running" in run(svc.capture_now()) and fetched == []
-    svc.sweep_service = SimpleNamespace(scan_running=False)
+    svc.market_data = MarketData()
     assert run(svc.capture_now()) == "Levels recorded."
+    fetched = svc.market_data.requests
     assert [f[0] for f in fetched] == [PAIR_GBP, PAIR_EUR] and len(table.rows) == 2
     assert fetched[0][1:] == (sw.ONE_H_INTERVAL, sw.ONE_H_LOOKBACK)
     assert any(7 < s <= 8 for s in sleeps)  # the second request waited out the spacing

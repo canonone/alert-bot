@@ -1,10 +1,8 @@
 """The second pair group, EURJPY / GBPJPY: same engine, its own table, and kept apart from GBPUSD / EURUSD.
 In-memory tables, injectable clock, no network (the real SQL is in test_integration_postgres.py)."""
-import asyncio
-import datetime
 import logging
 
-import app.services.daily_sweep_service as sw
+import app.services.daily_candles as sw
 import app.services.smt_divergence_service as smt
 from app.services.smt_divergence_service import (
     ACTIVE,
@@ -18,7 +16,7 @@ from app.services.smt_divergence_service import (
     SmtDivergenceHub,
 )
 
-from test_daily_sweep import HOUR, day_hours
+from test_daily_candles import HOUR, day_hours
 from test_smt_divergence import CLOSE, LEVEL_DAY
 from test_smt_service import MIN, NOW, MemTable, Subscribers, day_candles, run
 
@@ -89,19 +87,37 @@ def test_each_group_records_its_own_levels_in_its_own_table():
     assert hub.active_symbols() == {EJ, GJ, "GBPUSD", "EURUSD"}
 
 
-def test_the_sweep_scan_feeds_both_groups_in_its_alphabetical_order():
-    async def body():
-        hub, usd, jpy, *_ = make_hub()
-        candles = {**day_candles(), **jpy_candles()}
-        for pair in ("AUDJPY", EJ, "EURUSD", GJ):  # the scan's order
-            hub.on_candles(pair, candles.get(pair, []), LEVEL_DAY, NOW)
-        await asyncio.gather(*hub.services[1]._tasks)
-        assert len(jpy.rows) == 2 and usd.rows == {}  # JPY has both pairs; USD still waits for GBPUSD
-        hub.on_candles("GBPUSD", candles["GBPUSD"], LEVEL_DAY, NOW)
-        await asyncio.gather(*hub.services[0]._tasks)
-        assert len(usd.rows) == 2 and len(jpy.rows) == 2
+def test_the_daily_capture_records_both_groups_and_asks_for_a_retry_when_one_cannot(monkeypatch, caplog):
+    monkeypatch.setattr(sw, "SCAN_REQUEST_SPACING_SECONDS", 0)
+    market = MarketData()
+    hub, usd, jpy, *_ = make_hub(market_data=market)
+    real = market.get_candles
 
-    run(body())
+    async def jpy_quota(pair, interval, api_key, outputsize):
+        if pair == GJ:
+            return [], True
+        return await real(pair, interval, api_key, outputsize)
+
+    market.get_candles = jpy_quota
+    with caplog.at_level(logging.INFO):
+        assert run(hub.record_levels()) is False
+    assert len(usd.rows) == 2 and jpy.rows == {}
+    assert "[SmtDivergence JPY] Twelve Data quota exceeded" in caplog.text
+    market.get_candles = real
+    market.requests.clear()
+    assert run(hub.record_levels()) is True  # the retry
+    assert market.requests == [EJ, GJ] and len(jpy.rows) == 2  # USD is not fetched again
+
+
+def test_an_error_in_one_groups_capture_asks_for_a_retry_without_stopping_the_other(monkeypatch):
+    monkeypatch.setattr(sw, "SCAN_REQUEST_SPACING_SECONDS", 0)
+    hub, _, jpy, *_ = make_hub(market_data=MarketData())
+
+    async def broken():
+        raise RuntimeError("boom")
+
+    hub.services[0].record_levels = broken
+    assert run(hub.record_levels()) is False and len(jpy.rows) == 2
 
 
 # ── Live behaviour, on 0.01 pips ────────────────────────────────────────────

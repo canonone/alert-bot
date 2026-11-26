@@ -3,7 +3,6 @@ import datetime
 
 import pytest
 
-import app.services.daily_sweep_service as sw
 import app.services.smt_divergence_service as smt
 from app.services.smt_divergence_service import (
     ACTIVE,
@@ -16,7 +15,7 @@ from app.services.smt_divergence_service import (
     PAIR_GBP,
 )
 
-from test_daily_sweep import HOUR, D, candle, ny, utc
+from test_daily_candles import HOUR, D, candle, utc
 
 PIP = 0.0001
 LEVELS = {LOW: {PAIR_GBP: 1.2650, PAIR_EUR: 1.0720}, HIGH: {PAIR_GBP: 1.2780, PAIR_EUR: 1.0850}}
