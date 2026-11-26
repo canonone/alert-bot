@@ -1,6 +1,7 @@
-"""SMT (smart money) divergence between GBPUSD and EURUSD on the daily timeframe.
+"""SMT (smart money) divergence on the daily timeframe, for two separate pair groups: GBPUSD / EURUSD and
+EURJPY / GBPJPY. The groups never mix: each has its own table, levels, state and alerts, and runs the same rules.
 
-The two pairs are positively correlated, so they should take out their previous-day liquidity at about the same
+The two pairs of a group are positively correlated, so they should take out their previous-day liquidity at about the same
 time. At each trading-day close (17:00 America/New_York) the previous-day high (PDH) and low (PDL) of both pairs are
 recorded from the synthetic daily candles Daily Sweep builds. For the next trading day each SIDE is watched on its
 own:
@@ -19,7 +20,8 @@ time the pair is in sync (CONFIRMED) and nothing is sent. Each side fires at mos
 Every transition is an atomic conditional UPDATE (`... WHERE status = <expected>`), and a message is only sent by
 the caller whose claim succeeded, so restarts, duplicate ticks and the tick-vs-timer race can't send twice.
 
-This module has three layers: pure functions (this top part, no I/O), the in-memory row state, and the service.
+This module has four layers: pure functions (this top part, no I/O), the in-memory row state, the service for ONE
+pair group, and the hub that presents all groups to the rest of the bot as a single object.
 """
 import asyncio
 import datetime
@@ -33,7 +35,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 import app.services.daily_sweep_service as sweep
 from app.db import SessionLocal
-from app.models import SmtDivergenceLevel
+from app.models import SmtDivergenceLevel, SmtJpyDivergenceLevel
 from app.services.market_data_service import MarketDataService
 from app.services.users_service import UsersService
 
@@ -47,7 +49,7 @@ HOUR = datetime.timedelta(hours=1)
 ZERO = datetime.timedelta(0)
 
 PAIR_GBP, PAIR_EUR = "GBPUSD", "EURUSD"
-PAIRS = (PAIR_GBP, PAIR_EUR)
+PAIR_EURJPY, PAIR_GBPJPY = "EURJPY", "GBPJPY"
 
 LOW, HIGH = "LOW", "HIGH"
 SIDES = (LOW, HIGH)
@@ -77,6 +79,37 @@ DEADLINE_CHECK_INTERVAL_SECONDS = 60
 BASIS_TICK, BASIS_HOUR, BASIS_DETECTED = "tick", "hour", "detected"
 
 
+@dataclass(frozen=True)
+class PairGroup:
+    """Two correlated pairs compared with each other, and where their rows live."""
+
+    pairs: tuple[str, str]
+    model: type  # its table: the shared columns plus <pair>_level for each of the two pairs
+    constraint: str  # the unique (trading_day, side) constraint of that table
+    title_tag: str = ""  # added to the alert title to tell the groups apart
+    log_prefix: str = "[SmtDivergence]"
+
+    @property
+    def label(self) -> str:
+        return " / ".join(self.pairs)
+
+
+def level_column(pair: str) -> str:
+    return f"{pair.lower()}_level"
+
+
+USD_GROUP = PairGroup((PAIR_GBP, PAIR_EUR), SmtDivergenceLevel, "uq_smt_day_side")
+JPY_GROUP = PairGroup(
+    (PAIR_EURJPY, PAIR_GBPJPY), SmtJpyDivergenceLevel, "uq_smt_jpy_day_side", " (JPY)", "[SmtDivergence JPY]"
+)
+GROUPS = (USD_GROUP, JPY_GROUP)
+
+
+def group_for(pair: str) -> PairGroup:
+    """The group a pair belongs to (a pair is in at most one)."""
+    return next(group for group in GROUPS if pair in group.pairs)
+
+
 def touch_buffer_pips_for(pair: str) -> float:
     return PAIR_TOUCH_BUFFER_PIPS.get(pair, TOUCH_BUFFER_PIPS)
 
@@ -86,7 +119,8 @@ def near_miss_pips_for(pair: str) -> float:
 
 
 def other_pair(pair: str) -> str:
-    return PAIR_EUR if pair == PAIR_GBP else PAIR_GBP
+    first, second = group_for(pair).pairs
+    return second if pair == first else first
 
 
 def level_name(side: str) -> str:
@@ -199,8 +233,9 @@ def replay_side(
     basis "detected" means the "bars" are single price readings taken now (no bars were available): times are `now`.
     """
     bar_len = HOUR if basis == BASIS_HOUR else ZERO
+    pairs = group_for(next(iter(levels))).pairs
     first: dict[str, tuple[datetime.datetime, float]] = {}
-    for pair in PAIRS:
+    for pair in pairs:
         for bar in bars.get(pair, []):
             if bar["datetime"] >= day_close:
                 continue
@@ -219,7 +254,7 @@ def replay_side(
         return best
 
     if len(first) == 2:
-        leader, laggard = sorted(PAIRS, key=lambda p: first[p][0])
+        leader, laggard = sorted(pairs, key=lambda p: first[p][0])
         lead_at, lead_price = first[leader]
         lag_at, lag_price = first[laggard]
         if lag_at - lead_at <= bar_len:  # the same hour, or the very next one: ambiguous, so in sync
@@ -250,7 +285,7 @@ def replay_side(
 
 @dataclass
 class RowState:
-    """The cached mirror of a smt_divergence_levels row that is still open (ACTIVE / LEADER_TOUCHED). Ticks work on
+    """The cached mirror of an SMT divergence row that is still open (ACTIVE / LEADER_TOUCHED). Ticks work on
     this, never on the database."""
 
     id: int
@@ -273,10 +308,10 @@ class RowState:
         return other_pair(self.leader_pair) if self.leader_pair else None
 
     @classmethod
-    def from_model(cls, row: SmtDivergenceLevel) -> "RowState":
+    def from_model(cls, row, group: PairGroup = USD_GROUP) -> "RowState":
         return cls(
             id=row.id, trading_day=row.trading_day, side=row.side,
-            levels={PAIR_GBP: row.gbpusd_level, PAIR_EUR: row.eurusd_level}, expires_at=row.expires_at,
+            levels={pair: getattr(row, level_column(pair)) for pair in group.pairs}, expires_at=row.expires_at,
             status=row.status, leader_pair=row.leader_pair, leader_touched_at=row.leader_touched_at,
             leader_price=row.leader_price, leader_touch_basis=row.leader_touch_basis, deadline_at=row.deadline_at,
             laggard_best=row.laggard_best_price, detected_late=row.detected_late,
@@ -323,7 +358,7 @@ def format_divergence(
     window = minutes_between(leader_touched_at, deadline_at) if basis == BASIS_TICK else DIVERGENCE_WAIT_MINUTES
 
     lines = [
-        f"🔀 <b>SMT DIVERGENCE — {name}</b>",
+        f"🔀 <b>SMT DIVERGENCE{group_for(leader).title_tag} — {name}</b>",
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         f"🥇 <b>{leader}</b> took its {name} {fmt_leader(lead_level)} — {when}",
@@ -374,24 +409,25 @@ def format_divergence(
 
 # ── Pure: the /divergence status text ───────────────────────────────────────
 
-def format_status_message(rows: list, now: datetime.datetime) -> str:
-    """`rows`: the smt_divergence_levels rows of the period being monitored (any objects with the model's fields)."""
+def format_status_message(rows: list, now: datetime.datetime, group: PairGroup = USD_GROUP) -> str:
+    """One group's section. `rows`: its rows of the period being monitored (any objects with the model's fields)."""
+    title = f"🔀 <b>SMT Divergence — {group.label}</b>"
     if not rows:
         return (
-            "🔀 <b>SMT Divergence — GBPUSD / EURUSD</b>\n\nNo levels are being monitored yet. They are recorded at the "
+            f"{title}\n\nNo levels are being monitored yet. They are recorded at the "
             "17:10 New York scan after each trading day closes."
         )
     first = rows[0]
     lines = [
-        "🔀 <b>SMT Divergence — GBPUSD / EURUSD</b>",
+        title,
         f"Levels from {first.trading_day:%a %Y-%m-%d} · monitored until {sweep._wat_str(first.expires_at)}",
         "━━━━━━━━━━━━━━━━━━━━",
     ]
     for row in sorted(rows, key=lambda r: (r.side != HIGH,)):  # PDH first, then PDL
         name = level_name(row.side)
         lines.append(
-            f"<b>{name}</b>  GBPUSD {sweep.format_price(PAIR_GBP, row.gbpusd_level)} · "
-            f"EURUSD {sweep.format_price(PAIR_EUR, row.eurusd_level)}"
+            f"<b>{name}</b>  "
+            + " · ".join(f"{pair} {sweep.format_price(pair, getattr(row, level_column(pair)))}" for pair in group.pairs)
         )
         lines.append("   " + _status_line(row, now))
     lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -410,7 +446,7 @@ def _status_line(row, now: datetime.datetime) -> str:
             when = sweep._wat_str(row.leader_touched_at)
         line = f"🟡 {row.leader_pair} touched its {name} {when} — {laggard} must touch by {sweep._wat_str(row.deadline_at)}"
         if row.laggard_best_price is not None:
-            level = row.gbpusd_level if laggard == PAIR_GBP else row.eurusd_level
+            level = getattr(row, level_column(laggard))
             line += f" (closest so far: {pips_from_level(row.side, level, row.laggard_best_price, laggard):.1f} pips away)"
         return line
     if row.status == CONFIRMED:
@@ -420,7 +456,26 @@ def _status_line(row, now: datetime.datetime) -> str:
     return "⌛ expired — neither pair touched its level"
 
 
-# ── The service ─────────────────────────────────────────────────────────────
+# ── The service (one pair group) ────────────────────────────────────────────
+
+class RequestPacer:
+    """Keeps the SMT services' own Twelve Data fetches spaced like the sweep scan's. Shared by all groups, so one
+    group's first request doesn't follow straight after another group's last."""
+
+    def __init__(self) -> None:
+        self._last = float("-inf")
+        self._lock = asyncio.Lock()
+
+    async def run(self, request: Callable[[], Awaitable]):
+        async with self._lock:
+            wait = self._last + sweep.SCAN_REQUEST_SPACING_SECONDS - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                return await request()
+            finally:
+                self._last = time.monotonic()
+
 
 class SmtDivergenceService:
     def __init__(
@@ -429,7 +484,12 @@ class SmtDivergenceService:
         market_data: MarketDataService,
         users_service: UsersService,
         send_message: SendMessage,
+        group: PairGroup = USD_GROUP,
+        pacer: RequestPacer | None = None,
     ) -> None:
+        self.group = group
+        self.pairs = group.pairs
+        self.pacer = pacer or RequestPacer()
         self.api_key = api_key
         self.market_data = market_data
         self.users_service = users_service
@@ -451,7 +511,6 @@ class SmtDivergenceService:
         self._captured_day: datetime.date | None = None
         self._capture_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
-        self._last_td_request_at = float("-inf")
 
     # ── Database (every access lives here; tests swap these for an in-memory table) ──
 
@@ -461,7 +520,7 @@ class SmtDivergenceService:
         """Inserts a side already in the state the replay found. None = it exists already (the unique constraint is
         the once-only claim, so a rescan creates and announces nothing twice)."""
         values = dict(
-            trading_day=trading_day, side=side, gbpusd_level=levels[PAIR_GBP], eurusd_level=levels[PAIR_EUR],
+            trading_day=trading_day, side=side, **{level_column(pair): levels[pair] for pair in self.pairs},
             status=state.status, leader_pair=state.leader_pair, leader_touched_at=state.leader_touched_at,
             leader_price=state.leader_price, leader_touch_basis=state.leader_touch_basis, deadline_at=state.deadline_at,
             resolved_at=state.resolved_at, laggard_touched_at=state.laggard_touched_at, laggard_price=state.laggard_price,
@@ -469,21 +528,22 @@ class SmtDivergenceService:
         )
         async with SessionLocal() as session:
             result = await session.execute(
-                pg_insert(SmtDivergenceLevel).values(**values)
-                .on_conflict_do_nothing(constraint="uq_smt_day_side").returning(SmtDivergenceLevel.id)
+                pg_insert(self.group.model).values(**values)
+                .on_conflict_do_nothing(constraint=self.group.constraint).returning(self.group.model.id)
             )
             row_id = result.scalar_one_or_none()
             await session.commit()
         return row_id
 
     async def _load_open_rows(self, now: datetime.datetime) -> list[RowState]:
+        model = self.group.model
         async with SessionLocal() as session:
             result = await session.execute(
-                select(SmtDivergenceLevel).where(
-                    SmtDivergenceLevel.status.in_((ACTIVE, LEADER_TOUCHED)), SmtDivergenceLevel.expires_at > now
+                select(model).where(
+                    model.status.in_((ACTIVE, LEADER_TOUCHED)), model.expires_at > now
                 )
             )
-            return [RowState.from_model(row) for row in result.scalars().all()]
+            return [RowState.from_model(row, self.group) for row in result.scalars().all()]
 
     async def _claim(
         self,
@@ -497,16 +557,17 @@ class SmtDivergenceService:
     ) -> bool:
         """Atomic conditional UPDATE: only the caller that finds the row still in `expected` (and the time conditions
         holding) gets rowcount 1 and may announce the new state."""
-        conditions = [SmtDivergenceLevel.id == row_id, SmtDivergenceLevel.status == expected]
+        model = self.group.model
+        conditions = [model.id == row_id, model.status == expected]
         if deadline_gt is not None:
-            conditions.append(SmtDivergenceLevel.deadline_at > deadline_gt)
+            conditions.append(model.deadline_at > deadline_gt)
         if deadline_le is not None:
-            conditions.append(SmtDivergenceLevel.deadline_at <= deadline_le)
+            conditions.append(model.deadline_at <= deadline_le)
         if expires_le is not None:
-            conditions.append(SmtDivergenceLevel.expires_at <= expires_le)
+            conditions.append(model.expires_at <= expires_le)
         async with SessionLocal() as session:
             result = await session.execute(
-                update(SmtDivergenceLevel).where(*conditions).values(status=new, **values)
+                update(model).where(*conditions).values(status=new, **values)
             )
             claimed = result.rowcount == 1
             await session.commit()
@@ -514,10 +575,11 @@ class SmtDivergenceService:
 
     async def _flush_best(self, row_id: int, best: float | None) -> bool:
         """Best-effort write of the laggard's closest approach while its window is open."""
+        model = self.group.model
         async with SessionLocal() as session:
             result = await session.execute(
-                update(SmtDivergenceLevel)
-                .where(SmtDivergenceLevel.id == row_id, SmtDivergenceLevel.status == LEADER_TOUCHED)
+                update(model)
+                .where(model.id == row_id, model.status == LEADER_TOUCHED)
                 .values(laggard_best_price=best)
             )
             await session.commit()
@@ -525,32 +587,35 @@ class SmtDivergenceService:
 
     async def _expire_in_db(self, now: datetime.datetime) -> list[int]:
         """Rows nobody touched by the end of their monitored day. Silent."""
+        model = self.group.model
         async with SessionLocal() as session:
             result = await session.execute(
-                update(SmtDivergenceLevel)
-                .where(SmtDivergenceLevel.status == ACTIVE, SmtDivergenceLevel.expires_at <= now)
+                update(model)
+                .where(model.status == ACTIVE, model.expires_at <= now)
                 .values(status=EXPIRED, resolved_at=now)
-                .returning(SmtDivergenceLevel.id)
+                .returning(model.id)
             )
             ids = [row[0] for row in result.all()]
             await session.commit()
         return ids
 
-    async def _select_current(self, now: datetime.datetime) -> list[SmtDivergenceLevel]:
+    async def _select_current(self, now: datetime.datetime) -> list:
+        model = self.group.model
         async with SessionLocal() as session:
             result = await session.execute(
-                select(SmtDivergenceLevel)
-                .where(SmtDivergenceLevel.expires_at > now)
-                .order_by(SmtDivergenceLevel.trading_day.desc(), SmtDivergenceLevel.side)
+                select(model)
+                .where(model.expires_at > now)
+                .order_by(model.trading_day.desc(), model.side)
             )
             rows = list(result.scalars().all())
         latest = rows[0].trading_day if rows else None
         return [row for row in rows if row.trading_day == latest]
 
     async def _count_rows(self, trading_day: datetime.date) -> int:
+        model = self.group.model
         async with SessionLocal() as session:
             result = await session.execute(
-                select(func.count()).select_from(SmtDivergenceLevel).where(SmtDivergenceLevel.trading_day == trading_day)
+                select(func.count()).select_from(model).where(model.trading_day == trading_day)
             )
             return result.scalar_one()
 
@@ -562,10 +627,10 @@ class SmtDivergenceService:
         now = self.clock()
         await self._expire_in_db(now)
         self._rows = {row.id: row for row in await self._load_open_rows(now)}
-        logger.info(f"[SmtDivergence] Resumed {len(self._rows)} open row(s) from the database")
+        logger.info(f"{self.group.log_prefix} Resumed {len(self._rows)} open row(s) from the database")
 
     def active_symbols(self) -> set[str]:
-        return set(PAIRS) if self._rows else set()
+        return set(self.pairs) if self._rows else set()
 
     # ── Prices ───────────────────────────────────────────────────────────────
 
@@ -589,22 +654,22 @@ class SmtDivergenceService:
     ) -> None:
         """DailySweepService.candle_listeners hook. Cheap and synchronous (it runs inside the sweep scan): it only
         buffers the candles and, once both pairs are in, spawns the capture as its own task."""
-        if pair not in PAIRS:
+        if pair not in self.pairs:
             return
         self._candles[pair] = (expected_day, candles_1h)
         if self._captured_day == expected_day:
             return
-        if all(self._candles.get(p, (None, []))[0] == expected_day for p in PAIRS):
+        if all(self._candles.get(p, (None, []))[0] == expected_day for p in self.pairs):
             task = asyncio.create_task(self._capture_from_buffer(expected_day))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
 
     async def _capture_from_buffer(self, expected_day: datetime.date) -> None:
         try:
-            if await self.capture({p: self._candles[p][1] for p in PAIRS}, expected_day):
+            if await self.capture({p: self._candles[p][1] for p in self.pairs}, expected_day):
                 self._captured_day = expected_day
         except Exception as error:
-            logger.error(f"[SmtDivergence] Level capture failed: {error}")
+            logger.error(f"{self.group.log_prefix} Level capture failed: {error}")
 
     async def capture(self, candles_by_pair: dict[str, list[dict]], expected_day: datetime.date) -> bool:
         """Records both pairs' PDH/PDL from `expected_day`'s synthetic daily candle (only if BOTH pairs' latest
@@ -613,10 +678,10 @@ class SmtDivergenceService:
         async with self._capture_lock:
             now = self.clock()
             days: dict[str, sweep.DailyCandle] = {}
-            for pair in PAIRS:
+            for pair in self.pairs:
                 candles = candles_by_pair.get(pair)
                 if not candles:
-                    logger.warning(f"[SmtDivergence] No candles for {pair} yet — levels not recorded")
+                    logger.warning(f"{self.group.log_prefix} No candles for {pair} yet — levels not recorded")
                     return False
                 usable = sweep.usable_daily_candles(
                     sweep.aggregate_1h_to_daily(candles, now, sweep.min_daily_bars_for(pair)), pair
@@ -624,7 +689,7 @@ class SmtDivergenceService:
                 if not usable or usable[-1].date != expected_day:
                     latest = usable[-1].date if usable else None
                     logger.warning(
-                        f"[SmtDivergence] {pair} latest complete trading day is {latest}, expected {expected_day} — "
+                        f"{self.group.log_prefix} {pair} latest complete trading day is {latest}, expected {expected_day} — "
                         "levels not recorded (retry)"
                     )
                     return False
@@ -632,32 +697,32 @@ class SmtDivergenceService:
 
             expires_at = monitored_until(expected_day)
             if now >= expires_at:
-                logger.info(f"[SmtDivergence] The monitored period of {expected_day} is already over — nothing to arm")
+                logger.info(f"{self.group.log_prefix} The monitored period of {expected_day} is already over — nothing to arm")
                 return True
-            day_close = days[PAIR_GBP].end_utc
+            day_close = days[self.pairs[0]].end_utc
             bars = {
                 pair: [b for b in sweep.bars_since(candles_by_pair[pair], day_close) if b["datetime"] < expires_at]
-                for pair in PAIRS
+                for pair in self.pairs
             }
             basis = BASIS_HOUR
             if not any(bars.values()):  # no bars since the close: use the latest prices instead
                 basis = BASIS_DETECTED
-                for pair in PAIRS:
+                for pair in self.pairs:
                     price = self._fresh_price(pair, now)
                     if price is not None:
                         bars[pair] = [{"datetime": now, "high": price, "low": price}]
 
             created = 0
             for side in SIDES:
-                levels = {pair: (days[pair].low if side == LOW else days[pair].high) for pair in PAIRS}
+                levels = {pair: (days[pair].low if side == LOW else days[pair].high) for pair in self.pairs}
                 logger.info(
-                    f"[SmtDivergence] {expected_day} {level_name(side)}: "
-                    + " · ".join(f"{pair} {levels[pair]}" for pair in PAIRS)
+                    f"{self.group.log_prefix} {expected_day} {level_name(side)}: "
+                    + " · ".join(f"{pair} {levels[pair]}" for pair in self.pairs)
                 )
                 state = replay_side(side, levels, bars, now, expires_at, basis)
                 row_id = await self._insert_row(expected_day, side, levels, expires_at, state)
                 if row_id is None:
-                    logger.info(f"[SmtDivergence] {expected_day} {level_name(side)} already recorded")
+                    logger.info(f"{self.group.log_prefix} {expected_day} {level_name(side)} already recorded")
                     continue
                 created += 1
                 row = RowState(
@@ -670,41 +735,39 @@ class SmtDivergenceService:
                     self._rows[row_id] = row
                     if state.status == LEADER_TOUCHED:
                         logger.info(
-                            f"[SmtDivergence] {level_name(side)}: {state.leader_pair} already touched its level when armed "
+                            f"{self.group.log_prefix} {level_name(side)}: {state.leader_pair} already touched its level when armed "
                             f"({state.leader_touch_basis}); {other_pair(state.leader_pair)} has until {state.deadline_at}"
                         )
                 elif state.status == CONFIRMED:
-                    logger.info(f"[SmtDivergence] {level_name(side)}: both pairs already touched in sync when armed — silent")
+                    logger.info(f"{self.group.log_prefix} {level_name(side)}: both pairs already touched in sync when armed — silent")
                 else:
                     await self._send_divergence(
                         row, now, state.laggard_price if state.laggard_touched_at else self._latest_price(row.laggard),
                         state.laggard_touched_at, state.detected_late,
                     )
-            logger.info(f"[SmtDivergence] Levels for {expected_day}: {created} new row(s)")
+            logger.info(f"{self.group.log_prefix} Levels for {expected_day}: {created} new row(s)")
             if self._rows and self.subscribe_symbol is not None:
-                for pair in PAIRS:
+                for pair in self.pairs:
                     try:
                         await self.subscribe_symbol(pair)
                     except Exception as error:
-                        logger.error(f"[SmtDivergence] Could not subscribe {pair} to the live feed: {error}")
+                        logger.error(f"{self.group.log_prefix} Could not subscribe {pair} to the live feed: {error}")
             return True
 
     async def capture_now(self) -> str:
-        """Own fetch of just the two pairs (the sweep scan normally feeds the levels): for /divscan and the startup
+        """Own fetch of just this group's two pairs (the sweep scan normally feeds the levels): for /divscan and the startup
         catch-up. Shares the Twelve Data spacing and never runs while a sweep scan is in progress."""
         if self.sweep_service is not None and self.sweep_service.scan_running:
-            return "A Daily Sweep scan is running — it feeds the levels itself when it reaches GBPUSD and EURUSD."
+            return f"A Daily Sweep scan is running — it feeds the levels itself when it reaches {' and '.join(self.pairs)}."
         now = self.clock()
         expected_day = sweep.latest_closed_trading_day(now)
         candles: dict[str, list[dict]] = {}
-        for pair in PAIRS:
-            wait = self._last_td_request_at + sweep.SCAN_REQUEST_SPACING_SECONDS - time.monotonic()
-            if wait > 0:
-                await asyncio.sleep(wait)
-            data, quota_exceeded = await self.market_data.get_candles(
-                pair, sweep.ONE_H_INTERVAL, self.api_key, outputsize=sweep.ONE_H_LOOKBACK
+        for pair in self.pairs:
+            data, quota_exceeded = await self.pacer.run(
+                lambda: self.market_data.get_candles(
+                    pair, sweep.ONE_H_INTERVAL, self.api_key, outputsize=sweep.ONE_H_LOOKBACK
+                )
             )
-            self._last_td_request_at = time.monotonic()
             if quota_exceeded:
                 return "Twelve Data quota exceeded — try again in a minute."
             if not data:
@@ -733,7 +796,7 @@ class SmtDivergenceService:
             return None
         if self.sweep_service is not None and await self.sweep_service.needs_catch_up():
             return "the Daily Sweep catch-up scan will feed the levels"
-        logger.info("[SmtDivergence] Levels for the latest closed trading day are missing — capturing them")
+        logger.info(f"{self.group.log_prefix} Levels for the latest closed trading day are missing — capturing them")
         return await self.capture_now()
 
     # ── State changes: one atomic claim each ─────────────────────────────────
@@ -750,7 +813,7 @@ class SmtDivergenceService:
         try:
             claimed = await self._claim(row.id, expected, new, values, **conditions)
         except Exception as error:
-            logger.error(f"[SmtDivergence] Could not move row #{row.id} {expected} -> {new}: {error}")
+            logger.error(f"{self.group.log_prefix} Could not move row #{row.id} {expected} -> {new}: {error}")
             return "error"
         finally:
             self._inflight.discard(row.id)
@@ -769,7 +832,7 @@ class SmtDivergenceService:
         return "won"
 
     async def check_tick(self, symbol: str, price: float, previous_price: float | None) -> None:
-        if symbol not in PAIRS:
+        if symbol not in self.pairs:
             return
         now = self.clock()
         self._ticks[symbol] = (price, now)
@@ -781,7 +844,7 @@ class SmtDivergenceService:
             try:
                 await self._on_tick(row, symbol, price, now)
             except Exception as error:
-                logger.error(f"[SmtDivergence] Tick handling failed for row #{row.id}: {error}")
+                logger.error(f"{self.group.log_prefix} Tick handling failed for row #{row.id}: {error}")
 
     async def _on_tick(self, row: RowState, symbol: str, price: float, now: datetime.datetime) -> None:
         if row.status == ACTIVE:
@@ -795,13 +858,13 @@ class SmtDivergenceService:
                 if await self._transition(row, ACTIVE, LEADER_TOUCHED, values) == "won":
                     row.laggard_best, row.best_dirty = values["laggard_best_price"], False
                     logger.info(
-                        f"[SmtDivergence] {level_name(row.side)}: {symbol} touched its level {row.levels[symbol]} @ {price}; "
+                        f"{self.group.log_prefix} {level_name(row.side)}: {symbol} touched its level {row.levels[symbol]} @ {price}; "
                         f"{laggard} has until {row.deadline_at}"
                     )
             elif outcome == CONFIRMED:
                 values = dict(resolved_at=now, leader_touched_at=now, leader_touch_basis=BASIS_TICK, laggard_touched_at=now)
                 if await self._transition(row, ACTIVE, CONFIRMED, values) == "won":
-                    logger.info(f"[SmtDivergence] {level_name(row.side)}: both pairs are beyond their level — in sync, silent")
+                    logger.info(f"{self.group.log_prefix} {level_name(row.side)}: both pairs are beyond their level — in sync, silent")
             return
 
         if row.status != LEADER_TOUCHED:
@@ -818,7 +881,7 @@ class SmtDivergenceService:
             values = dict(resolved_at=now, laggard_touched_at=now, laggard_price=price, laggard_best_price=row.laggard_best)
             outcome = laggard_touch_outcome(row.deadline_at, now)
             if outcome == CONFIRMED and await self._transition(row, LEADER_TOUCHED, CONFIRMED, values, deadline_gt=now) == "won":
-                logger.info(f"[SmtDivergence] {level_name(row.side)}: {symbol} touched its level in time — in sync, silent")
+                logger.info(f"{self.group.log_prefix} {level_name(row.side)}: {symbol} touched its level in time — in sync, silent")
 
     async def _resolve_divergence(
         self, row: RowState, now: datetime.datetime, laggard_touch_price: float | None = None
@@ -846,7 +909,7 @@ class SmtDivergenceService:
         detected_late: bool,
     ) -> None:
         logger.info(
-            f"[SmtDivergence] DIVERGENCE {level_name(row.side)}: {row.leader_pair} took its level, {row.laggard} "
+            f"{self.group.log_prefix} DIVERGENCE {level_name(row.side)}: {row.leader_pair} took its level, {row.laggard} "
             f"{'touched it late' if laggard_touched_at else 'did not touch it'} (closest approach {row.laggard_best})"
         )
         message = format_divergence(
@@ -866,9 +929,9 @@ class SmtDivergenceService:
                     await self._resolve_divergence(row, now)
                 elif row.status == ACTIVE and now >= row.expires_at:
                     if await self._transition(row, ACTIVE, EXPIRED, dict(resolved_at=now), expires_le=now) == "won":
-                        logger.info(f"[SmtDivergence] {level_name(row.side)} {row.trading_day}: nobody touched — expired")
+                        logger.info(f"{self.group.log_prefix} {level_name(row.side)} {row.trading_day}: nobody touched — expired")
             except Exception as error:
-                logger.error(f"[SmtDivergence] Deadline check failed for row #{row.id}: {error}")
+                logger.error(f"{self.group.log_prefix} Deadline check failed for row #{row.id}: {error}")
         for row in list(self._rows.values()):
             if row.status == LEADER_TOUCHED and row.best_dirty and row.id not in self._inflight:
                 row.best_dirty = False
@@ -876,11 +939,93 @@ class SmtDivergenceService:
                     await self._flush_best(row.id, row.laggard_best)
                 except Exception as error:
                     row.best_dirty = True
-                    logger.error(f"[SmtDivergence] Could not save row #{row.id}'s closest approach: {error}")
+                    logger.error(f"{self.group.log_prefix} Could not save row #{row.id}'s closest approach: {error}")
         for row_id in await self._expire_in_db(now):
             self._rows.pop(row_id, None)
 
     # ── Commands ─────────────────────────────────────────────────────────────
 
     async def get_status_message(self) -> str:
-        return format_status_message(await self._select_current(self.clock()), self.clock())
+        return format_status_message(await self._select_current(self.clock()), self.clock(), self.group)
+
+
+# ── The hub (all pair groups) ───────────────────────────────────────────────
+
+class SmtDivergenceHub:
+    """What the rest of the bot talks to: it fans each call out to one SmtDivergenceService per pair group. A failure
+    in one group is logged and never stops the other."""
+
+    def __init__(
+        self,
+        api_key: str,
+        market_data: MarketDataService,
+        users_service: UsersService,
+        send_message: SendMessage,
+        groups: tuple[PairGroup, ...] = GROUPS,
+    ) -> None:
+        pacer = RequestPacer()
+        self.services = [
+            SmtDivergenceService(api_key, market_data, users_service, send_message, group, pacer) for group in groups
+        ]
+
+    def wire(
+        self,
+        sweep_service: sweep.DailySweepService | None = None,
+        subscribe_symbol: SubscribeSymbol | None = None,
+        get_last_price: Callable[[str], tuple[float, datetime.datetime] | None] | None = None,
+    ) -> None:
+        for service in self.services:
+            if sweep_service is not None:
+                service.sweep_service = sweep_service
+            if subscribe_symbol is not None:
+                service.subscribe_symbol = subscribe_symbol
+            if get_last_price is not None:
+                service.get_last_price = get_last_price
+
+    async def _each(self, what: str, call: Callable[[SmtDivergenceService], Awaitable]) -> list[tuple]:
+        """Runs `call` on every group in turn: (service, result, error) for each."""
+        outcomes = []
+        for service in self.services:
+            try:
+                outcomes.append((service, await call(service), None))
+            except Exception as error:
+                logger.error(f"{service.group.log_prefix} {what} failed: {error}")
+                outcomes.append((service, None, error))
+        return outcomes
+
+    async def bootstrap(self) -> None:
+        for service in self.services:
+            await service.bootstrap()
+
+    def active_symbols(self) -> set[str]:
+        return set().union(*(service.active_symbols() for service in self.services))
+
+    def on_candles(
+        self, pair: str, candles_1h: list[dict], expected_day: datetime.date, now: datetime.datetime
+    ) -> None:
+        for service in self.services:
+            if pair in service.pairs:
+                service.on_candles(pair, candles_1h, expected_day, now)
+
+    async def check_tick(self, symbol: str, price: float, previous_price: float | None) -> None:
+        await self._each("Tick check", lambda s: s.check_tick(symbol, price, previous_price))
+
+    async def check_deadlines(self) -> None:
+        await self._each("Deadline check", lambda s: s.check_deadlines())
+
+    async def catch_up(self) -> str | None:
+        done = [
+            f"{service.group.label}: {result}"
+            for service, result, _ in await self._each("Catch-up", lambda s: s.catch_up())
+            if result is not None
+        ]
+        return "; ".join(done) or None
+
+    async def capture_now(self) -> str:
+        outcomes = await self._each("Level capture", lambda s: s.capture_now())
+        return "\n".join(
+            f"{service.group.label}: {f'failed — {error}' if error else result}" for service, result, error in outcomes
+        )
+
+    async def get_status_message(self) -> str:
+        return "\n\n".join([await service.get_status_message() for service in self.services])

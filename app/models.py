@@ -143,12 +143,10 @@ class DailySweepScanState(Base):
     )
 
 
-class SmtDivergenceLevel(Base):
-    """One side (LOW = previous-day lows, HIGH = previous-day highs) of one monitored period for the GBPUSD/EURUSD
-    SMT divergence check. See SmtDivergenceService for the state machine."""
-
-    __tablename__ = "smt_divergence_levels"
-    __table_args__ = (UniqueConstraint("trading_day", "side", name="uq_smt_day_side"),)
+class SmtLevelColumns:
+    """The columns every SMT divergence table shares. A row is one side (LOW = previous-day lows, HIGH =
+    previous-day highs) of one monitored period for one pair group; each group has its own table, which adds the two
+    level columns, named <pair>_level. See SmtDivergenceService for the state machine."""
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
@@ -156,8 +154,6 @@ class SmtDivergenceLevel(Base):
     # the period monitored runs from that close until the next trading day closes (expires_at).
     trading_day: Mapped[datetime.date] = mapped_column(Date)
     side: Mapped[str] = mapped_column(String(4))  # "LOW" | "HIGH"
-    gbpusd_level: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
-    eurusd_level: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
 
     # ACTIVE -> LEADER_TOUCHED -> CONFIRMED | DIVERGENCE;  ACTIVE -> EXPIRED  (every step an atomic claim)
     status: Mapped[str] = mapped_column(String(16), index=True, default="ACTIVE")
@@ -178,6 +174,26 @@ class SmtDivergenceLevel(Base):
 
     expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SmtDivergenceLevel(SmtLevelColumns, Base):
+    """GBPUSD / EURUSD."""
+
+    __tablename__ = "smt_divergence_levels"
+    __table_args__ = (UniqueConstraint("trading_day", "side", name="uq_smt_day_side"),)
+
+    gbpusd_level: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
+    eurusd_level: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
+
+
+class SmtJpyDivergenceLevel(SmtLevelColumns, Base):
+    """EURJPY / GBPJPY."""
+
+    __tablename__ = "smt_jpy_divergence_levels"
+    __table_args__ = (UniqueConstraint("trading_day", "side", name="uq_smt_jpy_day_side"),)
+
+    eurjpy_level: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
+    gbpjpy_level: Mapped[float] = mapped_column(Numeric(18, 6, asdecimal=False))
 
 
 class InviteCode(Base):
