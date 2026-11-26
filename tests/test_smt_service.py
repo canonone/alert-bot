@@ -34,7 +34,8 @@ class MemTable:
 
     OPEN = (ACTIVE, LEADER_TOUCHED)
 
-    def __init__(self):
+    def __init__(self, group=smt.USD_GROUP):
+        self.group = group
         self.rows: dict[int, dict] = {}
         self.claims: list[tuple] = []
         self._next = 1
@@ -45,7 +46,7 @@ class MemTable:
             return None
         row_id, self._next = self._next, self._next + 1
         self.rows[row_id] = dict(
-            id=row_id, trading_day=trading_day, side=side, gbpusd_level=levels[PAIR_GBP], eurusd_level=levels[PAIR_EUR],
+            id=row_id, trading_day=trading_day, side=side, **{smt.level_column(p): levels[p] for p in self.group.pairs},
             status=state.status, leader_pair=state.leader_pair, leader_touched_at=state.leader_touched_at,
             leader_price=state.leader_price, leader_touch_basis=state.leader_touch_basis, deadline_at=state.deadline_at,
             resolved_at=state.resolved_at, laggard_touched_at=state.laggard_touched_at, laggard_price=state.laggard_price,
@@ -54,7 +55,7 @@ class MemTable:
         return row_id
 
     async def load_open_rows(self, now):
-        return [RowState.from_model(SimpleNamespace(**r)) for r in self.rows.values()
+        return [RowState.from_model(SimpleNamespace(**r), self.group) for r in self.rows.values()
                 if r["status"] in self.OPEN and r["expires_at"] > now]
 
     async def claim(self, row_id, expected, new, values, deadline_gt=None, deadline_le=None, expires_le=None):

@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from telegram.ext import Application, ContextTypes
 
 from app.services.daily_sweep_service import SCAN_RETRY_DELAY_SECONDS, DailySweepService
-from app.services.smt_divergence_service import DEADLINE_CHECK_INTERVAL_SECONDS, SmtDivergenceService
+from app.services.smt_divergence_service import DEADLINE_CHECK_INTERVAL_SECONDS, SmtDivergenceHub
 from app.services.price_alert_service import PriceAlertService
 from app.services.users_service import UsersService
 from app.telegram_bot import TelegramBotService
@@ -19,7 +19,7 @@ def register_jobs(
     telegram_bot: TelegramBotService,
     users_service: UsersService,
     daily_sweep_service: DailySweepService | None = None,
-    smt_divergence_service: SmtDivergenceService | None = None,
+    smt_divergence_service: SmtDivergenceHub | None = None,
 ) -> None:
     async def run_daily_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("[DailyCleanup] Running daily alert cleanup at 10 PM WAT")

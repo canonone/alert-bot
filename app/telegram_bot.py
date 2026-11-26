@@ -522,7 +522,7 @@ class TelegramBotService:
             message += f"\n\nNo usable data for: {', '.join(report.retry_pairs)}"
         await self.send_message_to_user(chat_id, message)
 
-    # ── SMT divergence (GBPUSD / EURUSD) ──────────────────────────
+    # ── SMT divergence (GBPUSD / EURUSD and EURJPY / GBPJPY) ──────
 
     async def _smt_unavailable(self, chat_id: str) -> bool:
         if self.smt_divergence_service is None:
@@ -552,9 +552,9 @@ class TelegramBotService:
         if await self._smt_unavailable(chat_id):
             return
         await self.send_message_to_user(
-            chat_id, "🔄 Recording the GBPUSD / EURUSD levels now (two Twelve Data requests)…"
+            chat_id, "🔄 Recording the GBPUSD / EURUSD and EURJPY / GBPJPY levels now (four Twelve Data requests)…"
         )
-        # Two spaced requests: don't hold up the other Telegram updates while they run
+        # Four spaced requests: don't hold up the other Telegram updates while they run
         task = asyncio.create_task(self._run_manual_smt_capture(chat_id))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
@@ -602,8 +602,8 @@ class TelegramBotService:
             "<code>/contalerts [on|off]</code> — continuation notifications (separate from sweeps)\n"
             "Same scan, same <code>/sweeps</code> and <code>/sweepcheck</code> commands\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>🔀 SMT Divergence</b> (GBPUSD / EURUSD)\n\n"
-            "<code>/divalerts [on|off]</code> — divergence notifications\n"
+            "<b>🔀 SMT Divergence</b> (GBPUSD / EURUSD · EURJPY / GBPJPY)\n\n"
+            "<code>/divalerts [on|off]</code> — divergence notifications (both pair groups)\n"
             "<code>/divergence</code> (or <code>/smt</code>) — watched PDH/PDL levels and where each side stands\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "🔴 SL · 🟢 TP · 🎯 TARGET\n"
@@ -618,7 +618,7 @@ class TelegramBotService:
                 "<code>/listcodes</code> — view all codes\n"
                 "<code>/revokecode [CODE]</code> — delete a code\n"
                 "<code>/sweepscan</code> — run the Daily Sweep + Continuation scan now\n"
-                "<code>/divscan</code> — record the GBPUSD / EURUSD SMT levels now"
+                "<code>/divscan</code> — record the SMT levels of both pair groups now"
             )
 
         await self.send_message_to_user(chat_id, msg)

@@ -866,3 +866,79 @@ def test_smt_tick_versus_timer_race_has_one_outcome_on_real_rows():
                 assert messages == (1 if row.status == "DIVERGENCE" else 0)  # exactly one outcome, and only a divergence speaks
 
     run(body)
+
+
+# ── SMT divergence: the second table (EURJPY / GBPJPY) ──────────────────────
+
+from app.models import SmtJpyDivergenceLevel  # noqa: E402
+from app.services.smt_divergence_service import JPY_GROUP, SmtDivergenceHub  # noqa: E402
+
+
+def _jpy_candles():
+    return {"EURJPY": day_hours(SMT_DAY, 161.80, 162.50, 161.20, 162.00),
+            "GBPJPY": day_hours(SMT_DAY, 189.00, 189.90, 188.40, 189.50)}
+
+
+def test_jpy_table_is_added_to_a_running_deployment_without_touching_the_usd_one():
+    async def body():
+        async with pg() as (engine, Session):
+            async with engine.begin() as conn:  # a deployment from before the JPY group existed
+                await conn.execute(text("DROP TABLE smt_jpy_divergence_levels"))
+            async with Session() as session:
+                session.add(_smt_row())
+                await session.commit()
+            await db_module.init_db()
+            await db_module.init_db()  # idempotent
+            async with Session() as session:
+                usd = (await session.execute(select(SmtDivergenceLevel))).scalars().all()
+                assert [(r.side, r.gbpusd_level, r.eurusd_level) for r in usd] == [("LOW", 1.25, 1.05)]
+                assert (await session.execute(select(SmtJpyDivergenceLevel))).scalars().all() == []
+
+    run(body)
+
+
+def test_both_groups_claim_their_own_rows_and_resume_after_a_restart():
+    async def body():
+        async with pg() as (engine, Session):
+            users, sent, clock = UsersService(), [], {"now": SMT_NOW}
+
+            async def send(chat_id, message):
+                sent.append((chat_id, message))
+
+            def hub():
+                h = SmtDivergenceHub("unused-key", None, users, send)
+                for service in h.services:
+                    service.clock = lambda: clock["now"]
+                return h
+
+            first = hub()
+            await _subscriber(Session, users)
+            usd, jpy = first.services
+            assert await usd.capture(_smt_candles(), SMT_DAY) is True
+            for _ in range(2):  # the JPY unique constraint is the once-only claim too
+                assert await jpy.capture(_jpy_candles(), SMT_DAY) is True
+            assert await jpy._count_rows(SMT_DAY) == 2 and await usd._count_rows(SMT_DAY) == 2
+
+            clock["now"] = SMT_T
+            await first.check_tick("EURJPY", 161.19, None)  # the JPY leader takes its PDL
+            clock["now"] = SMT_T + 10 * MINUTE
+            await first.check_tick("GBPJPY", 188.43, None)
+            await first.check_deadlines()  # saves the closest approach
+
+            restarted = hub()
+            await restarted.bootstrap()
+            assert restarted.active_symbols() == {"GBPUSD", "EURUSD", "EURJPY", "GBPJPY"}
+            clock["now"] = SMT_T + 61 * MINUTE
+            await restarted.check_deadlines()
+            await first.check_deadlines()  # the old instance loses the claim
+            assert len(sent) == 1 and "SMT DIVERGENCE (JPY) — PDL" in sent[0][1]
+            assert "closest approach 3.0 pips" in sent[0][1]
+            async with Session() as session:
+                rows = (await session.execute(select(SmtJpyDivergenceLevel))).scalars().all()
+                states = {r.side: (r.status, r.leader_pair) for r in rows}
+                assert states == {"LOW": ("DIVERGENCE", "EURJPY"), "HIGH": ("ACTIVE", None)}
+                usd_rows = (await session.execute(select(SmtDivergenceLevel))).scalars().all()
+                assert {r.status for r in usd_rows} == {"ACTIVE"}
+            assert "EURJPY / GBPJPY" in await restarted.get_status_message()
+
+    run(body)
