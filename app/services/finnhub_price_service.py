@@ -29,7 +29,8 @@ class FinnhubPriceService:
         # Optional Daily Sweep feature — ticks are forwarded to it when configured, and every pair
         # with an ACTIVE setup is subscribed even if nobody has a normal price alert on it
         self.daily_sweep_service = daily_sweep_service
-        # Optional SMT divergence feature (GBPUSD / EURUSD) — same idea: it gets every tick, and its pairs are
+        # Optional SMT divergence feature (GBPUSD / EURUSD and EURJPY / GBPJPY) — same idea:
+        # it gets every tick, and its pairs are
         # subscribed while any of its levels is still being watched
         self.smt_divergence_service = smt_divergence_service
 

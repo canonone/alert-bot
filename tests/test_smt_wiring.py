@@ -187,9 +187,12 @@ def test_build_services_wires_the_smt_service_to_the_sweep_scan_and_the_feed(mon
     telegram, finnhub = main.build_services()
     smt, sweep = telegram.smt_divergence_service, telegram.daily_sweep_service
     assert smt is not None and finnhub.smt_divergence_service is smt
-    assert smt.sweep_service is sweep and sweep.candle_listeners == [smt.on_candles]
-    assert smt.subscribe_symbol == finnhub.subscribe_to_symbol and smt.get_last_price == finnhub.get_last_tick
-    assert smt.api_key == "k"
+    assert sweep.candle_listeners == [smt.on_candles]
+    assert [s.pairs for s in smt.services] == [(PAIR_GBP, PAIR_EUR), ("EURJPY", "GBPJPY")]
+    for service in smt.services:  # every group is wired the same way
+        assert service.sweep_service is sweep and service.api_key == "k"
+        assert service.subscribe_symbol == finnhub.subscribe_to_symbol and service.get_last_price == finnhub.get_last_tick
+    assert smt.services[0].pacer is smt.services[1].pacer  # one Twelve Data spacing between them
 
 
 def test_without_the_twelve_data_key_the_feature_is_disabled_with_a_warning(monkeypatch, caplog):
@@ -286,7 +289,7 @@ def test_divscan_is_admin_only_and_runs_in_the_background():
     service, _, sent = bot()
     command(service, "admin", "/divscan")
     assert service.smt_divergence_service.captures == 1
-    assert "Recording the GBPUSD / EURUSD levels" in sent[0][1] and sent[-1][1] == "✅ Levels recorded."
+    assert "Recording the GBPUSD / EURUSD and EURJPY / GBPJPY levels" in sent[0][1] and sent[-1][1] == "✅ Levels recorded."
     service2, _, sent2 = bot()
     command(service2, "42", "/divscan")  # a normal user: ignored
     assert service2.smt_divergence_service.captures == 0 and sent2 == []

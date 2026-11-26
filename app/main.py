@@ -11,7 +11,7 @@ from app.services.finnhub_price_service import FinnhubPriceService
 from app.services.invite_service import InviteService
 from app.services.market_data_service import MarketDataService
 from app.services.price_alert_service import PriceAlertService
-from app.services.smt_divergence_service import SmtDivergenceService
+from app.services.smt_divergence_service import SmtDivergenceHub
 from app.services.users_service import UsersService
 from app.telegram_bot import TelegramBotService
 from app.webhook import create_webhook_app
@@ -50,17 +50,17 @@ def build_services() -> tuple[TelegramBotService, FinnhubPriceService]:
         logger.warning("TWELVE_DATA_API_KEY not set — Daily Sweep feature disabled")
     telegram_bot_service.daily_sweep_service = daily_sweep_service
 
-    # SMT divergence (GBPUSD / EURUSD): reuses the candles the Daily Sweep scan already fetches, so it needs the
-    # same Twelve Data key and is disabled (with a warning) without it
-    smt_divergence_service: SmtDivergenceService | None = None
+    # SMT divergence (GBPUSD / EURUSD and EURJPY / GBPJPY): reuses the candles the Daily Sweep scan already
+    # fetches, so it needs the same Twelve Data key and is disabled (with a warning) without it
+    smt_divergence_service: SmtDivergenceHub | None = None
     if config.TWELVE_DATA_API_KEY and daily_sweep_service is not None:
-        smt_divergence_service = SmtDivergenceService(
+        smt_divergence_service = SmtDivergenceHub(
             api_key=config.TWELVE_DATA_API_KEY,
             market_data=market_data,
             users_service=users_service,
             send_message=telegram_bot_service.send_message_to_user,
         )
-        smt_divergence_service.sweep_service = daily_sweep_service
+        smt_divergence_service.wire(sweep_service=daily_sweep_service)
         daily_sweep_service.candle_listeners.append(smt_divergence_service.on_candles)
     else:
         logger.warning("TWELVE_DATA_API_KEY not set — SMT divergence feature disabled")
@@ -76,8 +76,10 @@ def build_services() -> tuple[TelegramBotService, FinnhubPriceService]:
         daily_sweep_service.subscribe_symbol = finnhub_price_service.subscribe_to_symbol
         daily_sweep_service.get_last_price = finnhub_price_service.get_last_tick
     if smt_divergence_service is not None:
-        smt_divergence_service.subscribe_symbol = finnhub_price_service.subscribe_to_symbol
-        smt_divergence_service.get_last_price = finnhub_price_service.get_last_tick
+        smt_divergence_service.wire(
+            subscribe_symbol=finnhub_price_service.subscribe_to_symbol,
+            get_last_price=finnhub_price_service.get_last_tick,
+        )
     telegram_bot_service.finnhub_price_service = finnhub_price_service
 
     return telegram_bot_service, finnhub_price_service
