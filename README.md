@@ -84,9 +84,9 @@ Tables are created automatically on first run.
 | `/sweeps` (or `/setups`) | List all active setups — sweeps and continuations (pair, direction, level(s), which continuation level is hit, expiry in WAT) — only active setups; an invalidated one simply disappears |
 | `/sweepcheck [PAIR]` | Show the last two completed daily candles as the bot built them, and whether they form a sweep or continuation setup |
 | `/sweepscan` | Admin only: run the daily scan (both features) now |
-| `/divalerts [on\|off]` | Opt in/out of SMT divergence notifications (GBPUSD / EURUSD) |
-| `/divergence` (or `/smt`) | Show the GBPUSD / EURUSD PDH/PDL being watched and where each side stands (waiting, leader touched + deadline, confirmed, divergence sent), times in WAT |
-| `/divscan` | Admin only: record the GBPUSD / EURUSD levels now (two Twelve Data requests) |
+| `/divalerts [on\|off]` | Opt in/out of SMT divergence notifications (both pair groups) |
+| `/divergence` (or `/smt`) | Show both groups' PDH/PDL being watched and where each side stands (waiting, leader touched + deadline, confirmed, divergence sent), times in WAT |
+| `/divscan` | Admin only: record both groups' levels now (four Twelve Data requests) |
 | `/help` | Full command list |
 
 ### Alert Types
@@ -158,12 +158,15 @@ Day 1 closed exactly on its own high/low, or when an open fell back to the first
 kept as a harmless guard. `/sweepcheck` shows `open = previous close` per candle, and both values
 when the first 1H bar's open differs by more than 2 pips.
 
-### SMT Divergence Alerts (GBPUSD / EURUSD)
+### SMT Divergence Alerts (GBPUSD / EURUSD and EURJPY / GBPJPY)
 Requires `TWELVE_DATA_API_KEY` (like Daily Sweep; without it the feature is disabled with a startup warning).
-Opt in with `/divalerts on` (approved users only).
+Opt in with `/divalerts on` (approved users only); it covers both pair groups.
 
-GBPUSD and EURUSD are positively correlated, so they should take out their previous-day liquidity at about the
-same time. At each trading-day close (17:00 America/New_York) the previous-day high (PDH) and low (PDL) of both
+There are two **separate** pair groups, **GBPUSD / EURUSD** and **EURJPY / GBPJPY**. A pair is only ever compared
+with its partner: each group has its own levels, table, state and alerts (the JPY ones are titled
+`SMT DIVERGENCE (JPY)`), `/smt` shows one section per group, and a failure in one doesn't stop the other. Both
+follow the rules below. The two pairs of a group are positively correlated, so they should take out their
+previous-day liquidity at about the same time. At each trading-day close (17:00 America/New_York) the previous-day high (PDH) and low (PDL) of both
 pairs are recorded from the same synthetic daily candles Daily Sweep builds (not Twelve Data's `1day`). They are
 watched from that close until the **next** trading day closes (Friday's levels run through Monday's close). The
 two sides are independent: a LOW case (both should trade to their PDL, price ≤ PDL) and a HIGH case (both to
@@ -186,11 +189,11 @@ ACTIVE ──leader touches──▶ LEADER_TOUCHED ──laggard touches in tim
   **annotated, never suppressed**: it may be a feed difference between the Twelve Data levels and the Finnhub
   ticks. If the laggard's own tick touched its level *after* the deadline but before the timer ran, the alert says
   it "touched N min after the window closed" instead of "did not touch".
-- **Levels** are recorded by the 17:10 New York Daily Sweep scan, reusing the GBPUSD and EURUSD candles it already
+- **Levels** are recorded by the 17:10 New York Daily Sweep scan, reusing the candles of the four pairs it already
   fetched (no extra Twelve Data requests); the scan's own 15-minute retry covers a lagging pair, and a startup
-  catch-up (or `/divscan`, which fetches just the two pairs with the same request spacing and never while a sweep
-  scan is running) covers a missed scan. Because the scan is alphabetical, GBPUSD is reached a couple of minutes in,
-  so the first minutes of the period are covered by replaying the 1H bars since the close.
+  catch-up (or `/divscan`, which fetches just those pairs with the same request spacing and never while a sweep
+  scan is running) covers a missed scan. Because the scan is alphabetical, a group's second pair is reached a couple
+  of minutes in, so the first minutes of the period are covered by replaying the 1H bars since the close.
 - **Arming late** (the 17:10 scan itself, a catch-up, `/divscan`): the 1H bars since the close are replayed in order.
   A 1H bar only gives the hour a touch happened in, so the window is judged conservatively from the *end* of the
   leader's hour (alerts are never early, only possibly late): both pairs touching in the same or adjacent hour is
@@ -198,7 +201,7 @@ ACTIVE ──leader touches──▶ LEADER_TOUCHED ──laggard touches in tim
   the divergence immediately, labelled "⚡ Detected late" with the hour (never an exact time that wasn't observed).
 - **Deadlines don't depend on ticks:** a job checks pending windows every 60 seconds (so an alert can be up to a
   minute after the exact deadline) and closes untouched rows after the day ends. All state lives in Postgres
-  (`smt_divergence_levels`) and is rebuilt on startup, including the laggard's closest approach (saved when the row
+  (`smt_divergence_levels` for the USD group, `smt_jpy_divergence_levels` for the JPY group) and is rebuilt on startup, including the laggard's closest approach (saved when the row
   resolves and every minute while a window is open). Every state change is an atomic conditional `UPDATE`, and a
   message is only sent by the caller that won it, so restarts, duplicate ticks and the tick-vs-timer race can't
   produce two messages.
@@ -265,7 +268,7 @@ inherits that difference. High, low and close can also be a few pips off (typica
 
 The app creates missing tables on startup (so `daily_sweep_setups` appears automatically) and adds
 the `users.daily_sweep_alerts_enabled` and `users.divergence_alerts_enabled` columns if they're missing, and creates
-the `smt_divergence_levels` table (SMT divergence) automatically. It also adds the continuation columns
+the `smt_divergence_levels` and `smt_jpy_divergence_levels` tables (SMT divergence) automatically. It also adds the continuation columns
 (including `invalidated_at` / `invalidated_price`) and widens `daily_sweep_setups.status` from `VARCHAR(10)` to
 `VARCHAR(16)` so the `INVALIDATED` status fits (a no-rewrite change). All of this is idempotent and happens
 on startup; nothing is ever dropped at runtime, and there is no manual SQL for this upgrade.
@@ -303,7 +306,7 @@ app/
 │   ├── price_alert_service.py     # Alert CRUD + trigger logic
 │   ├── invite_service.py          # Invite-code generation/redemption
 │   ├── daily_sweep_service.py     # Daily Sweep: 17:00-NY daily candles, pattern scan, live level alerts
-│   ├── smt_divergence_service.py  # SMT divergence (GBPUSD/EURUSD): PDH/PDL levels, wait-window state machine, alerts
+│   ├── smt_divergence_service.py  # SMT divergence (USD and JPY pair groups): PDH/PDL levels, wait-window state machine, alerts
 │   └── finnhub_price_service.py   # Live Finnhub WebSocket feed
 ├── telegram_bot.py                # All bot commands + message routing
 ├── webhook.py                     # FastAPI app exposing POST /webhook/<token> (production only)
