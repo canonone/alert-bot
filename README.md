@@ -110,14 +110,14 @@ ACTIVE ──leader touches──▶ LEADER_TOUCHED ──laggard touches in tim
   └─ day closes, nobody touched ─▶ EXPIRED (silent)
 ```
 
-- The first pair to touch its level is the **leader** (either pair can lead). That starts a 60-minute window; if the
+- The first pair to touch its level is the **leader** (either pair can lead). That starts a 30-minute window; if the
   other pair (the **laggard**) touches its own level before the deadline the pair is in sync and nothing is sent.
-  If the deadline passes first it is a **divergence**. The deadline is `min(touch + 60 min, the day's close)`.
+  If the deadline passes first it is a **divergence**. The deadline is `min(touch + 30 min, the day's close)`.
 - "Touch" is any touch or break, no buffer by default (see the settings below). Weekend quotes are ignored.
 - **The alert** (one per divergence, no trade advice) gives the side (PDL/PDH), the leader, its level, when it
   touched (WAT) and the price, the laggard, its level, its current price and distance in pips, **its closest
   approach to the level during the window**, and the window length, plus a line stating what happened ("GBPUSD
-  took its PDL, EURUSD held above its PDL after 60 min"). A closest approach within `NEAR_MISS_PIPS` (2) is
+  took its PDL, EURUSD held above its PDL after 30 min"). A closest approach within `NEAR_MISS_PIPS` (2) is
   **annotated, never suppressed**: it may be a feed difference between the Twelve Data levels and the Finnhub
   ticks. If the laggard's own tick touched its level *after* the deadline but before the timer ran, the alert says
   it "touched N min after the window closed" instead of "did not touch".
@@ -152,7 +152,7 @@ Constants in `app/services/smt_divergence_service.py`, some with a per-pair over
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `DIVERGENCE_WAIT_MINUTES` | 60 | How long the laggard has, after the leader touches its level, to touch its own (capped by the day's close). |
+| `DIVERGENCE_WAIT_MINUTES` | 30 | How long the laggard has, after the leader touches its level, to touch its own (capped by the day's close). |
 | `TOUCH_BUFFER_PIPS` (`PAIR_TOUCH_BUFFER_PIPS`) | 0 | Tolerance that widens the touch zone toward price (price within this many pips of the level counts as a touch). 0 = a plain touch or break. |
 | `NEAR_MISS_PIPS` (`PAIR_NEAR_MISS_PIPS`) | 2 | A laggard whose closest approach stayed within this many pips of its level gets a "may be a feed difference" note on the alert (it is never suppressed). |
 | `DEADLINE_CHECK_INTERVAL_SECONDS` | 60 | How often the scheduler resolves windows whose deadline has passed. |

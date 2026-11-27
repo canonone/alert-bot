@@ -126,9 +126,9 @@ def test_jpy_divergence_sends_one_jpy_alert_and_leaves_usd_alone():
     hub, usd, jpy, sent, clock = armed()
     tick(hub, clock, T, EJ, LOW, 1)  # EURJPY takes its PDL
     assert jpy.status(LOW) == LEADER_TOUCHED and jpy.row(LOW)["leader_pair"] == EJ
-    tick(hub, clock, T + 10 * MIN, GJ, LOW, -1.5)  # GBPJPY gets within 1.5 pips (0.015)
-    timer(hub, clock, T + 60 * MIN)
-    timer(hub, clock, T + 61 * MIN)
+    tick(hub, clock, T + 5 * MIN, GJ, LOW, -1.5)  # GBPJPY gets within 1.5 pips (0.015)
+    timer(hub, clock, T + 30 * MIN)
+    timer(hub, clock, T + 31 * MIN)
     assert jpy.status(LOW) == DIVERGENCE and len(sent) == 1
     message = sent[0][1]
     assert "SMT DIVERGENCE (JPY) — PDL" in message
@@ -140,7 +140,7 @@ def test_jpy_divergence_sends_one_jpy_alert_and_leaves_usd_alone():
 def test_jpy_pdh_in_sync_is_silent():
     hub, _, jpy, sent, clock = armed()
     tick(hub, clock, T, GJ, HIGH, 0)
-    tick(hub, clock, T + 59 * MIN, EJ, HIGH, 0.5)
+    tick(hub, clock, T + 29 * MIN, EJ, HIGH, 0.5)
     timer(hub, clock, T + 2 * HOUR)
     assert jpy.status(HIGH) == CONFIRMED and sent == []
 
@@ -191,7 +191,7 @@ def test_one_group_failing_never_stops_the_other(caplog):
     hub.services[0].check_tick = hub.services[0].check_deadlines = broken
     with caplog.at_level(logging.ERROR):
         tick(hub, clock, T + MIN, GJ, LOW, -5)
-        timer(hub, clock, T + 61 * MIN)
+        timer(hub, clock, T + 31 * MIN)
     assert jpy.status(LOW) == DIVERGENCE and len(sent) == 1
     assert "Tick check failed: usd table is down" in caplog.text and "Deadline check failed" in caplog.text
 

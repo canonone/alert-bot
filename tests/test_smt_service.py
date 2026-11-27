@@ -226,12 +226,12 @@ def test_arming_with_the_leader_still_inside_its_window_resumes_waiting():
     run(svc.capture(candles, LEVEL_DAY))
     row = table.row(LOW)
     assert (row["status"], row["leader_pair"], row["leader_touch_basis"]) == (LEADER_TOUCHED, PAIR_GBP, "hour")
-    assert row["deadline_at"] == NOW + 60 * MIN  # judged from NOW (the hour is still running): never early
+    assert row["deadline_at"] == NOW + 30 * MIN  # judged from NOW (the hour is still running): never early
     assert row["laggard_best_price"] == pytest.approx(1.0720 + 6 * PIP)
     assert table.status(HIGH) == ACTIVE and sent == []
 
 
-def test_arming_with_the_leader_more_than_60_minutes_ago_alerts_immediately_labelled_late():
+def test_arming_with_the_leader_more_than_30_minutes_ago_alerts_immediately_labelled_late():
     svc, table, sent, _ = make(now=CLOSE + 3 * HOUR)
     candles = with_bars(day_candles(), LOW, gbp=[(0, 2)], eur=[(0, -6), (1, -5), (2, -4)])
     run(svc.capture(candles, LEVEL_DAY))
@@ -283,8 +283,8 @@ def test_both_touch_inside_the_window_is_confirmed_and_silent(side, leader, lagg
     tick(svc, clock, T, leader, side, 1)
     row = table.row(side)
     assert (row["status"], row["leader_pair"], row["leader_touch_basis"]) == (LEADER_TOUCHED, leader, "tick")
-    assert row["leader_touched_at"] == T and row["deadline_at"] == T + 60 * MIN
-    tick(svc, clock, T + 59 * MIN, laggard, side, 0)  # exactly at its level counts as a touch
+    assert row["leader_touched_at"] == T and row["deadline_at"] == T + 30 * MIN
+    tick(svc, clock, T + 29 * MIN, laggard, side, 0)  # exactly at its level counts as a touch
     assert table.status(side) == CONFIRMED and sent == []
     assert svc._rows and all(r.side != side for r in svc._rows.values())  # no longer watched
     other = HIGH if side == LOW else LOW
@@ -296,41 +296,41 @@ def test_both_touch_inside_the_window_is_confirmed_and_silent(side, leader, lagg
 def test_laggard_never_touches_is_a_divergence_sent_once_by_the_timer(side, leader, laggard):
     svc, table, sent, clock = seeded()
     tick(svc, clock, T, leader, side, 1.4)
-    tick(svc, clock, T + 20 * MIN, laggard, side, -9)
-    tick(svc, clock, T + 30 * MIN, laggard, side, -3)  # its closest approach: 3 pips short
-    tick(svc, clock, T + 40 * MIN, laggard, side, -6)
-    timer(svc, clock, T + 60 * MIN - datetime.timedelta(seconds=1))
+    tick(svc, clock, T + 10 * MIN, laggard, side, -9)
+    tick(svc, clock, T + 15 * MIN, laggard, side, -3)  # its closest approach: 3 pips short
+    tick(svc, clock, T + 20 * MIN, laggard, side, -6)
+    timer(svc, clock, T + 30 * MIN - datetime.timedelta(seconds=1))
     assert sent == [] and table.status(side) == LEADER_TOUCHED
-    timer(svc, clock, T + 60 * MIN)
+    timer(svc, clock, T + 30 * MIN)
     assert table.status(side) == DIVERGENCE and len(sent) == 1
     text = sent[0][1]
     name = "PDL" if side == LOW else "PDH"
     assert f"SMT DIVERGENCE — {name}" in text and f"🥇 <b>{leader}</b> took its {name}" in text
     assert f"🥈 <b>{laggard}</b> {name}" in text and "closest approach 3.0 pips from the level" in text
-    assert "held " + ("above" if side == LOW else "below") + f" its {name} after 60 min" in text
+    assert "held " + ("above" if side == LOW else "below") + f" its {name} after 30 min" in text
     assert "⚡ Detected" not in text  # on time
     # the closest approach is saved on the row when it resolves (it needn't have been flushed earlier)
     level = LEVELS[side][laggard]
     assert table.row(side)["laggard_best_price"] == pytest.approx(level + 3 * PIP if side == LOW else level - 3 * PIP)
-    timer(svc, clock, T + 61 * MIN)
-    tick(svc, clock, T + 62 * MIN, laggard, side, 5)  # a touch after it was already reported: nothing more
+    timer(svc, clock, T + 31 * MIN)
+    tick(svc, clock, T + 32 * MIN, laggard, side, 5)  # a touch after it was already reported: nothing more
     assert len(sent) == 1 and table.claims.count((table.row(side)["id"], LEADER_TOUCHED, DIVERGENCE)) == 1
 
 
 def test_low_and_high_are_independent_on_the_same_day():
     svc, table, sent, clock = seeded()
     tick(svc, clock, T, PAIR_GBP, LOW, 1)  # LOW: GBPUSD leads and EURUSD never follows
-    tick(svc, clock, T + 10 * MIN, PAIR_EUR, LOW, -4)
-    tick(svc, clock, T + 30 * MIN, PAIR_EUR, HIGH, 1)  # HIGH: EURUSD leads, GBPUSD follows in time
-    tick(svc, clock, T + 50 * MIN, PAIR_GBP, HIGH, 2)
-    timer(svc, clock, T + 61 * MIN)
+    tick(svc, clock, T + 5 * MIN, PAIR_EUR, LOW, -4)
+    tick(svc, clock, T + 15 * MIN, PAIR_EUR, HIGH, 1)  # HIGH: EURUSD leads, GBPUSD follows in time
+    tick(svc, clock, T + 25 * MIN, PAIR_GBP, HIGH, 2)
+    timer(svc, clock, T + 31 * MIN)
     assert (table.status(LOW), table.status(HIGH)) == (DIVERGENCE, CONFIRMED)
     assert len(sent) == 1 and "PDL" in sent[0][1]
     # and both can diverge: two separate alerts
     svc2, table2, sent2, clock2 = seeded()
     tick(svc2, clock2, T, PAIR_GBP, LOW, 1)
     tick(svc2, clock2, T + 5 * MIN, PAIR_EUR, HIGH, 1)
-    timer(svc2, clock2, T + 66 * MIN)
+    timer(svc2, clock2, T + 36 * MIN)
     assert (table2.status(LOW), table2.status(HIGH)) == (DIVERGENCE, DIVERGENCE) and len(sent2) == 2
     assert sorted("PDL" if "— PDL" in m else "PDH" for _, m in sent2) == ["PDH", "PDL"]
 
@@ -353,14 +353,14 @@ def test_a_stale_tick_of_the_other_pair_does_not_count_as_already_past():
 
 def test_window_cut_short_by_the_day_close():
     svc, table, sent, clock = seeded()
-    tick(svc, clock, UNTIL - 30 * MIN, PAIR_GBP, LOW, 1)
-    assert table.row(LOW)["deadline_at"] == UNTIL  # not touch + 60 min
+    tick(svc, clock, UNTIL - 15 * MIN, PAIR_GBP, LOW, 1)
+    assert table.row(LOW)["deadline_at"] == UNTIL  # not touch + 30 min
     tick(svc, clock, UNTIL - 5 * MIN, PAIR_EUR, LOW, -3)
     timer(svc, clock, UNTIL - datetime.timedelta(seconds=1))
     assert sent == []
     timer(svc, clock, UNTIL)
     assert table.status(LOW) == DIVERGENCE and len(sent) == 1
-    assert "⏱ Window: 30 min" in sent[0][1] and "after 30 min" in sent[0][1]
+    assert "⏱ Window: 15 min" in sent[0][1] and "after 15 min" in sent[0][1]
 
 
 def test_untouched_rows_expire_silently_at_the_close():
@@ -391,8 +391,8 @@ def test_friday_levels_run_through_monday_and_weekend_quotes_are_ignored():
     assert table.status(LOW) == ACTIVE
     sunday_open = utc(2026, 11, 1, 22, 30)  # Sunday 17:30 EST: Monday's session has started
     tick(svc, clock, sunday_open, PAIR_GBP, LOW, 1)
-    assert table.status(LOW) == LEADER_TOUCHED and table.row(LOW)["deadline_at"] == sunday_open + 60 * MIN
-    tick(svc, clock, sunday_open + 20 * MIN, PAIR_EUR, LOW, 1)
+    assert table.status(LOW) == LEADER_TOUCHED and table.row(LOW)["deadline_at"] == sunday_open + 30 * MIN
+    tick(svc, clock, sunday_open + 10 * MIN, PAIR_EUR, LOW, 1)
     assert table.status(LOW) == CONFIRMED
 
 
@@ -412,9 +412,9 @@ def test_duplicate_ticks_fire_each_transition_once():
     for _ in range(5):
         tick(svc, clock, T, PAIR_GBP, LOW, 1)
     assert table.claims == [(table.row(LOW)["id"], ACTIVE, LEADER_TOUCHED)]
-    timer(svc, clock, T + 61 * MIN)
+    timer(svc, clock, T + 31 * MIN)
     for _ in range(3):
-        timer(svc, clock, T + 62 * MIN)
+        timer(svc, clock, T + 32 * MIN)
     assert len(sent) == 1
 
 
@@ -423,7 +423,7 @@ def test_concurrent_ticks_and_timers_cannot_double_send():
     tick(svc, clock, T, PAIR_GBP, LOW, 1)
 
     async def storm():
-        clock["now"] = T + 61 * MIN
+        clock["now"] = T + 31 * MIN
         await asyncio.gather(
             svc.check_deadlines(), svc.check_deadlines(),
             svc.check_tick(PAIR_EUR, 1.0750, None), svc.check_tick(PAIR_GBP, 1.2640, None),
@@ -437,7 +437,7 @@ def test_concurrent_ticks_and_timers_cannot_double_send():
 def test_tick_versus_timer_race_at_the_deadline_has_one_outcome(tick_first):
     svc, table, sent, clock = seeded()
     tick(svc, clock, T, PAIR_GBP, LOW, 1)
-    deadline = T + 60 * MIN
+    deadline = T + 30 * MIN
 
     async def race():
         clock["now"] = deadline - datetime.timedelta(seconds=1)
@@ -456,21 +456,21 @@ def test_tick_versus_timer_race_at_the_deadline_has_one_outcome(tick_first):
 def test_laggard_touching_after_the_deadline_but_before_the_timer_says_so():
     svc, table, sent, clock = seeded()
     tick(svc, clock, T, PAIR_GBP, LOW, 1)
-    tick(svc, clock, T + 30 * MIN, PAIR_EUR, LOW, -4)
-    tick(svc, clock, T + 67 * MIN, PAIR_EUR, LOW, 1)  # 7 minutes after the window closed; the timer hasn't run
+    tick(svc, clock, T + 15 * MIN, PAIR_EUR, LOW, -4)
+    tick(svc, clock, T + 37 * MIN, PAIR_EUR, LOW, 1)  # 7 minutes after the window closed; the timer hasn't run
     assert table.status(LOW) == DIVERGENCE and len(sent) == 1
     text = sent[0][1]
     assert "touched 7 min after the window closed" in text
     assert "did not touch" not in text and "held above" not in text and "closest approach" not in text
-    assert table.row(LOW)["laggard_touched_at"] == T + 67 * MIN
-    timer(svc, clock, T + 68 * MIN)
+    assert table.row(LOW)["laggard_touched_at"] == T + 37 * MIN
+    timer(svc, clock, T + 38 * MIN)
     assert len(sent) == 1  # the timer can't send it again
 
 
 def test_a_tick_after_the_deadline_that_does_not_touch_still_resolves_it():
     svc, table, sent, clock = seeded()
     tick(svc, clock, T, PAIR_GBP, LOW, 1)
-    tick(svc, clock, T + 61 * MIN, PAIR_EUR, LOW, -5)  # the laggard's tick, short of its level, after the deadline
+    tick(svc, clock, T + 31 * MIN, PAIR_EUR, LOW, -5)  # the laggard's tick, short of its level, after the deadline
     assert table.status(LOW) == DIVERGENCE and len(sent) == 1 and "held above" in sent[0][1]
 
 
@@ -482,7 +482,7 @@ def test_two_instances_resolving_the_same_deadline_send_one_alert():
     tick(a, clock_a, T, PAIR_GBP, LOW, 1)
     b, _, sent_b, clock_b = make(table=table)
     run(b.bootstrap())
-    clock_a["now"] = clock_b["now"] = T + 61 * MIN
+    clock_a["now"] = clock_b["now"] = T + 31 * MIN
 
     async def both():
         await asyncio.gather(a.check_deadlines(), b.check_deadlines())
@@ -494,18 +494,18 @@ def test_two_instances_resolving_the_same_deadline_send_one_alert():
 def test_restart_mid_window_keeps_the_leader_deadline_and_closest_approach():
     svc, table, sent, clock = seeded()
     tick(svc, clock, T, PAIR_GBP, LOW, 1)
-    tick(svc, clock, T + 10 * MIN, PAIR_EUR, LOW, -6)
-    tick(svc, clock, T + 20 * MIN, PAIR_EUR, LOW, -2.5)
-    tick(svc, clock, T + 25 * MIN, PAIR_EUR, LOW, -4)
-    timer(svc, clock, T + 30 * MIN)  # the timer persists the closest approach
+    tick(svc, clock, T + 5 * MIN, PAIR_EUR, LOW, -6)
+    tick(svc, clock, T + 10 * MIN, PAIR_EUR, LOW, -2.5)
+    tick(svc, clock, T + 12 * MIN, PAIR_EUR, LOW, -4)
+    timer(svc, clock, T + 15 * MIN)  # the timer persists the closest approach
     assert table.row(LOW)["laggard_best_price"] == pytest.approx(1.0720 + 2.5 * PIP)
 
-    revived, _, sent2, clock2 = make(table=table, now=T + 35 * MIN)  # the bot restarts
+    revived, _, sent2, clock2 = make(table=table, now=T + 18 * MIN)  # the bot restarts
     run(revived.bootstrap())
     (row,) = [r for r in revived._rows.values() if r.side == LOW]
-    assert (row.status, row.leader_pair, row.deadline_at) == (LEADER_TOUCHED, PAIR_GBP, T + 60 * MIN)
+    assert (row.status, row.leader_pair, row.deadline_at) == (LEADER_TOUCHED, PAIR_GBP, T + 30 * MIN)
     assert row.laggard_best == pytest.approx(1.0720 + 2.5 * PIP)
-    timer(revived, clock2, T + 61 * MIN)
+    timer(revived, clock2, T + 31 * MIN)
     assert len(sent2) == 1 and "closest approach 2.5 pips from the level" in sent2[0][1]
     assert "feed difference" not in sent2[0][1]  # 2.5 pips is outside the 2-pip near-miss range
 
@@ -513,18 +513,18 @@ def test_restart_mid_window_keeps_the_leader_deadline_and_closest_approach():
 def test_restart_mid_window_then_the_laggard_touches_in_time():
     svc, table, sent, clock = seeded()
     tick(svc, clock, T, PAIR_EUR, HIGH, 1)
-    revived, _, sent2, clock2 = make(table=table, now=T + 20 * MIN)
+    revived, _, sent2, clock2 = make(table=table, now=T + 10 * MIN)
     run(revived.bootstrap())
-    tick(revived, clock2, T + 40 * MIN, PAIR_GBP, HIGH, 1)
+    tick(revived, clock2, T + 20 * MIN, PAIR_GBP, HIGH, 1)
     assert table.status(HIGH) == CONFIRMED and sent == [] and sent2 == []
 
 
 def test_a_window_that_closed_while_the_bot_was_down_is_reported_as_detected_late():
     svc, table, sent, clock = seeded()
     tick(svc, clock, T, PAIR_GBP, LOW, 1)
-    revived, _, sent2, clock2 = make(table=table, now=T + 75 * MIN)
+    revived, _, sent2, clock2 = make(table=table, now=T + 45 * MIN)
     run(revived.bootstrap())
-    timer(revived, clock2, T + 75 * MIN)
+    timer(revived, clock2, T + 45 * MIN)
     assert len(sent2) == 1 and "⚡ Detected 15 min after the window closed" in sent2[0][1]
     assert table.row(LOW)["detected_late"] is True
 
@@ -534,9 +534,9 @@ def test_a_window_that_closed_while_the_bot_was_down_is_reported_as_detected_lat
 def test_a_near_miss_is_annotated_and_still_sent():
     svc, table, sent, clock = seeded()
     tick(svc, clock, T, PAIR_GBP, LOW, 1)
-    tick(svc, clock, T + 30 * MIN, PAIR_EUR, LOW, -1.5)  # 1.5 pips short of EURUSD's PDL at its closest
-    tick(svc, clock, T + 50 * MIN, PAIR_EUR, LOW, -7)
-    timer(svc, clock, T + 61 * MIN)
+    tick(svc, clock, T + 15 * MIN, PAIR_EUR, LOW, -1.5)  # 1.5 pips short of EURUSD's PDL at its closest
+    tick(svc, clock, T + 25 * MIN, PAIR_EUR, LOW, -7)
+    timer(svc, clock, T + 31 * MIN)
     assert len(sent) == 1
     text = sent[0][1]
     assert "closest approach 1.5 pips from the level" in text
@@ -548,8 +548,8 @@ def test_closest_approach_is_the_laggards_alone_and_starts_when_the_window_opens
     tick(svc, clock, T - 5 * MIN, PAIR_EUR, LOW, -0.5)  # before anyone led: not part of the window
     tick(svc, clock, T, PAIR_GBP, LOW, 1)
     tick(svc, clock, T + 5 * MIN, PAIR_GBP, LOW, 4)  # the LEADER moving further is irrelevant
-    tick(svc, clock, T + 10 * MIN, PAIR_EUR, LOW, -6)
-    timer(svc, clock, T + 61 * MIN)
+    tick(svc, clock, T + 5 * MIN, PAIR_EUR, LOW, -6)
+    timer(svc, clock, T + 31 * MIN)
     assert "closest approach 6.0 pips from the level" in sent[0][1]
 
 
@@ -576,11 +576,11 @@ def test_only_divergence_subscribers_are_messaged():
     users = Subscribers(on=("alice", "bob"))
     svc, table, sent, clock = seeded(subscribers=users)
     tick(svc, clock, T, PAIR_GBP, LOW, 1)
-    timer(svc, clock, T + 61 * MIN)
+    timer(svc, clock, T + 31 * MIN)
     assert sorted(chat for chat, _ in sent) == ["alice", "bob"]
     quiet, table2, sent2, clock2 = seeded(subscribers=Subscribers(on=()))
     tick(quiet, clock2, T, PAIR_GBP, LOW, 1)
-    timer(quiet, clock2, T + 61 * MIN)
+    timer(quiet, clock2, T + 31 * MIN)
     assert sent2 == [] and table2.status(LOW) == DIVERGENCE  # still resolved; just nobody to tell
 
 
@@ -689,12 +689,12 @@ def test_status_message_shows_levels_and_each_sides_state():
     assert "<b>PDH</b>  GBPUSD 1.27800 · EURUSD 1.08500" in text and "<b>PDL</b>  GBPUSD 1.26500 · EURUSD 1.07200" in text
     assert text.count("⏳ waiting") == 2
     tick(svc, clock, T, PAIR_GBP, LOW, 1)
-    tick(svc, clock, T + 10 * MIN, PAIR_EUR, LOW, -3)
-    timer(svc, clock, T + 20 * MIN)  # (persists the closest approach)
+    tick(svc, clock, T + 5 * MIN, PAIR_EUR, LOW, -3)
+    timer(svc, clock, T + 10 * MIN)  # (persists the closest approach)
     text = run(svc.get_status_message())
-    assert "🟡 GBPUSD touched its PDL 2026-10-28 00:00 WAT — EURUSD must touch by 2026-10-28 01:00 WAT" in text
+    assert "🟡 GBPUSD touched its PDL 2026-10-28 00:00 WAT — EURUSD must touch by 2026-10-28 00:30 WAT" in text
     assert "(closest so far: 3.0 pips away)" in text
-    tick(svc, clock, T + 30 * MIN, PAIR_EUR, LOW, 1)
+    tick(svc, clock, T + 15 * MIN, PAIR_EUR, LOW, 1)
     assert "✅ confirmed" in run(svc.get_status_message())
     timer(svc, clock, UNTIL - MIN)
     assert "⌛ expired" not in run(svc.get_status_message())  # still inside the period
@@ -705,7 +705,7 @@ def test_status_message_shows_levels_and_each_sides_state():
 def test_status_message_for_a_divergence_and_when_nothing_is_monitored():
     svc, table, sent, clock = seeded()
     tick(svc, clock, T, PAIR_GBP, HIGH, 1)
-    timer(svc, clock, T + 61 * MIN)
+    timer(svc, clock, T + 31 * MIN)
     assert "🔀 divergence — alert sent" in run(svc.get_status_message())
     empty, _, _, _ = make()
     assert "No levels are being monitored yet" in run(empty.get_status_message())
@@ -714,10 +714,10 @@ def test_status_message_for_a_divergence_and_when_nothing_is_monitored():
 def test_confirmed_rows_keep_the_laggards_closest_approach_too():
     svc, table, sent, clock = seeded()
     tick(svc, clock, T, PAIR_GBP, LOW, 1)
-    tick(svc, clock, T + 10 * MIN, PAIR_EUR, LOW, -4)
-    tick(svc, clock, T + 20 * MIN, PAIR_EUR, LOW, 0.5)  # touches
+    tick(svc, clock, T + 5 * MIN, PAIR_EUR, LOW, -4)
+    tick(svc, clock, T + 10 * MIN, PAIR_EUR, LOW, 0.5)  # touches
     row = table.row(LOW)
-    assert row["status"] == CONFIRMED and row["laggard_touched_at"] == T + 20 * MIN
+    assert row["status"] == CONFIRMED and row["laggard_touched_at"] == T + 10 * MIN
     assert row["laggard_best_price"] == pytest.approx(1.0720 - 0.5 * PIP)  # its best IS the touching tick (0.5 pip beyond)
 
 
@@ -731,5 +731,5 @@ def test_concurrent_duplicate_leader_ticks_leave_the_row_watched():
     run(storm())
     assert table.claims == [(table.row(LOW)["id"], ACTIVE, LEADER_TOUCHED)]
     assert any(r.side == LOW and r.status == LEADER_TOUCHED for r in svc._rows.values())  # still in the cache
-    tick(svc, clock, T + 10 * MIN, PAIR_EUR, LOW, 1)  # so the laggard's touch is still seen
+    tick(svc, clock, T + 5 * MIN, PAIR_EUR, LOW, 1)  # so the laggard's touch is still seen
     assert table.status(LOW) == CONFIRMED

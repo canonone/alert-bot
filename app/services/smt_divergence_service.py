@@ -61,7 +61,7 @@ DIVERGENCE = "DIVERGENCE"
 EXPIRED = "EXPIRED"
 
 # How long the laggard has, after the leader touches its level, to touch its own.
-DIVERGENCE_WAIT_MINUTES = 60
+DIVERGENCE_WAIT_MINUTES = 30
 # "Trades to the level" is ANY touch or break. This is the tolerance (in pips; 0.0001 per pip for these pairs) that
 # widens the touch zone toward price: with a positive value, price within that many pips of the level counts as a
 # touch. Default 0 = a plain touch. Per-pair override.

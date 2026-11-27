@@ -86,11 +86,11 @@ def test_distance_to_the_level(side):
     assert smt.pips_from_level(side, level, level - away * 3 * PIP, PAIR_EUR) == pytest.approx(-3.0)  # touched
 
 
-def test_deadline_is_the_earlier_of_t_plus_60_and_the_day_close():
+def test_deadline_is_the_earlier_of_t_plus_30_and_the_day_close():
     t = utc(2026, 10, 28, 13, 0)
-    assert smt.window_deadline(t, UNTIL) == utc(2026, 10, 28, 14, 0)
-    assert smt.window_deadline(utc(2026, 10, 28, 20, 30), UNTIL) == UNTIL  # cut short by the close at 21:00
-    assert smt.window_deadline(utc(2026, 10, 28, 20, 0), UNTIL) == UNTIL  # exactly 60 min before: same
+    assert smt.window_deadline(t, UNTIL) == utc(2026, 10, 28, 13, 30)
+    assert smt.window_deadline(utc(2026, 10, 28, 20, 45), UNTIL) == UNTIL  # cut short by the close at 21:00
+    assert smt.window_deadline(utc(2026, 10, 28, 20, 30), UNTIL) == UNTIL  # exactly 30 min before: same
     assert smt.window_deadline(t, UNTIL, wait_minutes=15) == utc(2026, 10, 28, 13, 15)
 
 
@@ -163,7 +163,7 @@ def test_replay_leader_only_inside_its_window_resumes_waiting(side):
     r = replay(side, [(0, 1.5)], [(0, -6)], now=now)
     assert (r.status, r.leader_pair, r.leader_touch_basis) == (LEADER_TOUCHED, PAIR_GBP, "hour")
     assert r.leader_touched_at == hour(0)  # only the hour is known
-    assert r.deadline_at == now + datetime.timedelta(minutes=60)  # judged from NOW: never earlier than it should be
+    assert r.deadline_at == now + datetime.timedelta(minutes=30)  # judged from NOW: never earlier than it should be
     gap = smt.pips_from_level(side, LEVELS[side][PAIR_EUR], r.laggard_best_price, PAIR_EUR)
     assert gap == pytest.approx(6.0)  # the laggard's closest approach so far: 6 pips short of its level
     assert r.detected_late is False
@@ -171,12 +171,13 @@ def test_replay_leader_only_inside_its_window_resumes_waiting(side):
 
 @both
 def test_replay_leader_only_deadline_boundary(side):
-    # leader touched in the 21:00 hour; judged from the END of that hour (22:00): deadline 23:00 UTC
+    # leader touched in the 21:00 hour; judged from the END of that hour (22:00): deadline 22:30 UTC
+    deadline = hour(1) + datetime.timedelta(minutes=30)
     gbp, eur = [(0, 2)], [(0, -5), (1, -4)]
-    assert replay(side, gbp, eur, now=hour(2) - datetime.timedelta(seconds=1)).status == LEADER_TOUCHED
-    r = replay(side, gbp, eur, now=hour(2))
-    assert r.status == DIVERGENCE and r.detected_late is True and r.resolved_at == hour(2)
-    assert r.deadline_at == hour(2) and r.laggard_touched_at is None
+    assert replay(side, gbp, eur, now=deadline - datetime.timedelta(seconds=1)).status == LEADER_TOUCHED
+    r = replay(side, gbp, eur, now=deadline)
+    assert r.status == DIVERGENCE and r.detected_late is True and r.resolved_at == deadline
+    assert r.deadline_at == deadline and r.laggard_touched_at is None
 
 
 @both
@@ -200,7 +201,7 @@ def test_replay_laggard_two_or_more_hours_later_is_a_divergence(side):
     r = replay(side, [(0, 2)], [(2, 1)], now=hour(6))
     assert r.status == DIVERGENCE and r.detected_late is True
     assert (r.leader_pair, r.laggard_touched_at) == (PAIR_GBP, hour(2))
-    assert r.deadline_at == hour(2)  # leader's hour ended at 22:00, plus 60 min
+    assert r.deadline_at == hour(1) + datetime.timedelta(minutes=30)  # leader's hour ended, plus 30 min
     r = replay(side, [(3, 2)], [(0, 1)], now=hour(6))  # the other way round
     assert r.status == DIVERGENCE and r.leader_pair == PAIR_EUR and r.laggard_touched_at == hour(3)
 
@@ -208,9 +209,9 @@ def test_replay_laggard_two_or_more_hours_later_is_a_divergence(side):
 @both
 def test_replay_window_is_cut_short_by_the_day_close(side):
     close = hour(24)  # the monitored period ends 24 h after the level day closed
-    now = close - datetime.timedelta(minutes=30)  # the leader's hour (23:00-24:00) is still running
+    now = close - datetime.timedelta(minutes=15)  # the leader's hour (23:00-24:00) is still running
     r = replay(side, [(23, 2)], [(23, -6)], now=now, close=close)
-    assert r.status == LEADER_TOUCHED and r.deadline_at == close  # not now + 60 min: the close comes first
+    assert r.status == LEADER_TOUCHED and r.deadline_at == close  # not now + 30 min: the close comes first
     r = replay(side, [(23, 2)], [(23, -6)], now=close, close=close)
     assert r.status == DIVERGENCE and r.resolved_at == close
 
@@ -226,7 +227,7 @@ def test_replay_without_bars_uses_the_price_readings_taken_now(side):
     now = hour(3)
     leader_only = replay(side, [(3, 2)], [(3, -4)], now=now, basis="detected")
     assert leader_only.status == LEADER_TOUCHED and leader_only.leader_touch_basis == "detected"
-    assert leader_only.leader_touched_at == now and leader_only.deadline_at == now + datetime.timedelta(minutes=60)
+    assert leader_only.leader_touched_at == now and leader_only.deadline_at == now + datetime.timedelta(minutes=30)
     both_past = replay(side, [(3, 2)], [(3, 1)], now=now, basis="detected")
     assert both_past.status == CONFIRMED  # both already past their level: in sync
 
@@ -234,7 +235,7 @@ def test_replay_without_bars_uses_the_price_readings_taken_now(side):
 @both
 def test_replay_tracks_the_laggards_closest_approach_from_the_leaders_hour(side):
     # EUR: 9, 5 then 2.5 pips short at its best in hour 2 (it touches nothing); GBP leads in hour 1
-    r = replay(side, [(1, 1)], [(0, -1), (1, -5), (2, -2.5), (3, -4)], now=hour(2) + datetime.timedelta(minutes=30))
+    r = replay(side, [(1, 1)], [(0, -1), (1, -5), (2, -2.5), (3, -4)], now=hour(2) + datetime.timedelta(minutes=15))
     assert r.status == LEADER_TOUCHED
     gap = smt.pips_from_level(side, LEVELS[side][PAIR_EUR], r.laggard_best_price, PAIR_EUR)
     assert gap == pytest.approx(2.5)  # hour 0 (before the leader's hour) is not counted
@@ -250,7 +251,7 @@ def test_replay_buffer_widens_what_counts_as_a_touch(monkeypatch):
 # ── The alert text ──────────────────────────────────────────────────────────
 
 LEAD_AT = utc(2026, 10, 28, 13, 32)  # 14:32 WAT
-DEADLINE = utc(2026, 10, 28, 14, 32)  # 15:32 WAT
+DEADLINE = utc(2026, 10, 28, 14, 2)  # 15:02 WAT
 
 
 def alert(side=LOW, leader=PAIR_GBP, now=None, **kwargs):
@@ -268,8 +269,8 @@ def test_alert_for_a_low_divergence_with_closest_approach():
     assert "SMT DIVERGENCE — PDL" in text
     assert "🥇 <b>GBPUSD</b> took its PDL 1.26500 — touched 2026-10-28 14:32 WAT at 1.26470" in text
     assert "🥈 <b>EURUSD</b> PDL 1.07200 — price 1.07280 (8.0 pips above it), closest approach 3.0 pips from the level" in text
-    assert "⏱ Window: 60 min, closed 2026-10-28 15:32 WAT" in text
-    assert "ℹ️ GBPUSD took its PDL; EURUSD held above its PDL after 60 min." in text
+    assert "⏱ Window: 30 min, closed 2026-10-28 15:02 WAT" in text
+    assert "ℹ️ GBPUSD took its PDL; EURUSD held above its PDL after 30 min." in text
     assert "feed difference" not in text and "Detected" not in text  # 3.0 pips is not a near miss; and not late
     assert "<" not in text.replace("<b>", "").replace("</b>", "") and ">" not in text.replace("<b>", "").replace("</b>", "")
 
@@ -278,7 +279,7 @@ def test_alert_for_a_high_divergence_with_eurusd_leading():
     text = alert(HIGH, PAIR_EUR, laggard_price=1.2771, laggard_best=1.2774)
     assert "SMT DIVERGENCE — PDH" in text and "🥇 <b>EURUSD</b> took its PDH 1.08500" in text
     assert "🥈 <b>GBPUSD</b> PDH 1.27800 — price 1.27710 (9.0 pips below it), closest approach 6.0 pips from the level" in text
-    assert "EURUSD took its PDH; GBPUSD held below its PDH after 60 min." in text
+    assert "EURUSD took its PDH; GBPUSD held below its PDH after 30 min." in text
 
 
 def test_a_near_miss_is_annotated_but_never_suppressed():
