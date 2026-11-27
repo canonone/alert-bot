@@ -220,7 +220,7 @@ def test_smt_claims_are_atomic_and_their_time_conditions_hold_at_the_boundary():
 
             # a wrong expected status claims nothing
             assert await svc._claim(low, "LEADER_TOUCHED", "CONFIRMED", {}) is False
-            deadline = SMT_T + 60 * MINUTE
+            deadline = SMT_T + 30 * MINUTE
             leader = dict(leader_pair="GBPUSD", leader_touched_at=SMT_T, leader_price=1.2649, leader_touch_basis="tick", deadline_at=deadline)
             assert await svc._claim(low, "ACTIVE", "LEADER_TOUCHED", leader) is True
             assert await svc._claim(low, "ACTIVE", "LEADER_TOUCHED", leader) is False  # once
@@ -253,7 +253,7 @@ def test_smt_flush_expire_select_and_load_helpers():
             rows = await _smt_rows(Session)
             # the closest approach is only written while the window is open
             assert await svc._flush_best(rows["LOW"].id, 1.0724) is False  # still ACTIVE
-            await svc._claim(rows["LOW"].id, "ACTIVE", "LEADER_TOUCHED", dict(leader_pair="GBPUSD", leader_touched_at=SMT_T, deadline_at=SMT_T + 60 * MINUTE))
+            await svc._claim(rows["LOW"].id, "ACTIVE", "LEADER_TOUCHED", dict(leader_pair="GBPUSD", leader_touched_at=SMT_T, deadline_at=SMT_T + 30 * MINUTE))
             assert await svc._flush_best(rows["LOW"].id, 1.0724) is True
             assert (await _smt_rows(Session))["LOW"].laggard_best_price == 1.0724
 
@@ -285,25 +285,25 @@ def test_smt_full_lifecycle_on_real_rows_including_a_restart():
 
             clock["now"] = SMT_T
             await svc.check_tick("GBPUSD", _tick_price("GBPUSD", "LOW", 1), None)  # the leader touches its PDL
-            for minutes, pips_short in ((10, 6), (20, 2.5), (30, 5)):  # EURUSD wanders, closest 2.5 pips short
+            for minutes, pips_short in ((5, 6), (10, 2.5), (15, 5)):  # EURUSD wanders, closest 2.5 pips short
                 clock["now"] = SMT_T + minutes * MINUTE
                 await svc.check_tick("EURUSD", _tick_price("EURUSD", "LOW", -pips_short), None)
-            clock["now"] = SMT_T + 40 * MINUTE
+            clock["now"] = SMT_T + 20 * MINUTE
             await svc.check_deadlines()  # persists the closest approach
             row = (await _smt_rows(Session))["LOW"]
-            assert (row.status, row.leader_pair, row.leader_touch_basis, row.deadline_at) == ("LEADER_TOUCHED", "GBPUSD", "tick", SMT_T + 60 * MINUTE)
+            assert (row.status, row.leader_pair, row.leader_touch_basis, row.deadline_at) == ("LEADER_TOUCHED", "GBPUSD", "tick", SMT_T + 30 * MINUTE)
             assert row.laggard_best_price == pytest.approx(1.0720 + 2.5 * SMT_PIP)
 
             # restart: a new instance resumes from the rows
-            revived, _, sent2, clock2 = _smt_service(now=SMT_T + 50 * MINUTE)
+            revived, _, sent2, clock2 = _smt_service(now=SMT_T + 25 * MINUTE)
             await revived.bootstrap()
             assert revived.active_symbols() == {"GBPUSD", "EURUSD"}
-            clock2["now"] = SMT_T + 61 * MINUTE
+            clock2["now"] = SMT_T + 31 * MINUTE
             await revived.check_deadlines()
             assert len(sent2) == 1 and "SMT DIVERGENCE — PDL" in sent2[0][1]
             assert "closest approach 2.5 pips from the level" in sent2[0][1]
             row = (await _smt_rows(Session))["LOW"]
-            assert (row.status, row.laggard_best_price, row.resolved_at) == ("DIVERGENCE", pytest.approx(1.0720 + 2.5 * SMT_PIP), SMT_T + 61 * MINUTE)
+            assert (row.status, row.laggard_best_price, row.resolved_at) == ("DIVERGENCE", pytest.approx(1.0720 + 2.5 * SMT_PIP), SMT_T + 31 * MINUTE)
             await revived.check_deadlines()
             await svc.check_deadlines()  # the OLD instance still has the row cached: its claim loses, it sends nothing
             assert len(sent2) == 1 and sent == []
@@ -320,10 +320,10 @@ def test_smt_late_touch_on_a_tick_before_the_timer_is_worded_as_such():
             await svc.capture(_smt_candles(), SMT_DAY)
             clock["now"] = SMT_T
             await svc.check_tick("EURUSD", _tick_price("EURUSD", "HIGH", 1), None)  # EURUSD leads the HIGH case
-            clock["now"] = SMT_T + 67 * MINUTE  # 7 minutes after its window closed; the timer hasn't run
+            clock["now"] = SMT_T + 37 * MINUTE  # 7 minutes after its window closed; the timer hasn't run
             await svc.check_tick("GBPUSD", _tick_price("GBPUSD", "HIGH", 1), None)
             row = (await _smt_rows(Session))["HIGH"]
-            assert row.status == "DIVERGENCE" and row.laggard_touched_at == SMT_T + 67 * MINUTE
+            assert row.status == "DIVERGENCE" and row.laggard_touched_at == SMT_T + 37 * MINUTE
             assert len(sent) == 1 and "touched 7 min after the window closed" in sent[0][1] and "did not touch" not in sent[0][1]
             await svc.check_deadlines()
             assert len(sent) == 1
@@ -364,7 +364,7 @@ def test_smt_two_instances_cannot_both_announce_one_deadline():
             await a.check_tick("GBPUSD", _tick_price("GBPUSD", "LOW", 1), None)
             b, _, sent_b, clock_b = _smt_service()
             await b.bootstrap()
-            clock_a["now"] = clock_b["now"] = SMT_T + 61 * MINUTE
+            clock_a["now"] = clock_b["now"] = SMT_T + 31 * MINUTE
             await asyncio.gather(a.check_deadlines(), b.check_deadlines())
             assert len(sent_a) + len(sent_b) == 1
             assert (await _smt_rows(Session))["LOW"].status == "DIVERGENCE"
@@ -389,7 +389,7 @@ def test_smt_tick_versus_timer_race_has_one_outcome_on_real_rows():
                 await svc.check_tick("GBPUSD", _tick_price("GBPUSD", "LOW", 1), None)
                 timer_svc, _, sent_timer, clock_timer = _smt_service(now=touch)
                 await timer_svc.bootstrap()
-                deadline = touch + 60 * MINUTE
+                deadline = touch + 30 * MINUTE
                 clock_tick["now"] = deadline - datetime.timedelta(seconds=1)  # the laggard touches just BEFORE the deadline
                 clock_timer["now"] = deadline + datetime.timedelta(seconds=1)  # the timer fires just AFTER it
                 first, second = (
@@ -460,14 +460,14 @@ def test_both_groups_claim_their_own_rows_and_resume_after_a_restart():
 
             clock["now"] = SMT_T
             await first.check_tick("EURJPY", 161.19, None)  # the JPY leader takes its PDL
-            clock["now"] = SMT_T + 10 * MINUTE
+            clock["now"] = SMT_T + 5 * MINUTE
             await first.check_tick("GBPJPY", 188.43, None)
             await first.check_deadlines()  # saves the closest approach
 
             restarted = hub()
             await restarted.bootstrap()
             assert restarted.active_symbols() == {"GBPUSD", "EURUSD", "EURJPY", "GBPJPY"}
-            clock["now"] = SMT_T + 61 * MINUTE
+            clock["now"] = SMT_T + 31 * MINUTE
             await restarted.check_deadlines()
             await first.check_deadlines()  # the old instance loses the claim
             assert len(sent) == 1 and "SMT DIVERGENCE (JPY) — PDL" in sent[0][1]
